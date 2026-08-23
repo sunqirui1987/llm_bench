@@ -1,10 +1,7 @@
-"""N 路连续对话压测：测 cache、TTFT、token/s。"""
+"""命令行：bench / cache。真正的对话循环在 engine。"""
 
 from __future__ import annotations
 
-import threading
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 from . import session
@@ -23,37 +20,22 @@ from .config import (
     parse_list,
     resolve_base_urls,
 )
-from .conversation import Conversation
+from .engine import run_pool, turn_request as _turn_request
 from .prompts import compose_system, compose_user, estimate_tokens
 from .protocols.registry import PROTOCOLS
 from .reporting import (
     aggregate_cache_percent,
     cache_percent,
-    format_bench_row,
-    format_ms,
-    format_tps,
-    print_bench_header,
-    print_bench_row,
     print_model_average,
-    LiveFooter,
-    RoundLiveDisplay,
-    WorkerBoard,
     print_summary,
     print_stress_summary,
     print_token_totals,
-    separator,
-    worker_label,
     write_report,
 )
-from .stress import AdaptiveGate, StressReporter, StressStats
-from .transport import (
-    HttpStatusError,
-    call_with_retries,
-    configure_pool,
-    raise_fd_limit,
-)
+from .transport import configure_pool, raise_fd_limit
 
-_print_lock = threading.Lock()
+# 测试仍从 runner 导入 _turn_request
+__all__ = ["bench", "cache", "_turn_request"]
 
 
 def _prepare(
@@ -88,47 +70,6 @@ def _prepare(
     )
 
 
-def _turn_request(
-    *,
-    protocol,
-    base_url: str,
-    api_key: str,
-    model: str,
-    conversation: Conversation,
-    max_tokens: int,
-    timeout: int,
-    retries: int,
-    retry_delay: float,
-    on_progress=None,
-) -> dict:
-    """一路对话的一回合。hit 带同一条 session；miss 不带头，且 outbound 会打散前缀。"""
-    affinity = conversation.session_id
-
-    def once():
-        return protocol.stream(
-            base_url,
-            api_key,
-            model,
-            "",
-            "",
-            max_tokens,
-            timeout,
-            messages=conversation.outbound(),
-            session_id=affinity,
-            on_progress=on_progress,
-        )
-
-    result = call_with_retries(
-        once,
-        (),
-        retries,
-        retry_delay,
-        rotate_session_on_retry=False,
-    )
-    result["session_id"] = affinity
-    return result
-
-
 def _build_prompts(
     *,
     system: str,
@@ -151,6 +92,67 @@ def _build_prompts(
         compose_user(prompt, prompt_file),
         followup or "",
     )
+
+
+def _print_start(
+    *,
+    hit_cache: bool,
+    workers: int,
+    rounds,
+    duration: float,
+    cache_mode: str,
+    fd_limit: int,
+    base_urls: dict,
+    models: list[str],
+    formats: list[str],
+    initial_session: str,
+    retries: int,
+    retry_delay: float,
+    timeout: int,
+    system: str,
+    system_text: str,
+    prompt: str,
+    max_tokens: int,
+) -> None:
+    total = workers * max(int(rounds), 0)
+    if hit_cache:
+        title = "LLM Bench · 要缓存"
+        session_desc = f"每路钉死一条 session（示例 {initial_session}）"
+        cache_flow = "粘 session + 固定前缀；第 1 轮冷启，第 2 轮起应对上 cache"
+    else:
+        title = "LLM Bench · 不要缓存"
+        session_desc = "不带 session；每轮打散前缀"
+        cache_flow = "不带 session，并在 prompt 最前面换新盐"
+    print(f"\n{'═' * 88}")
+    print(
+        f"{title}  workers={workers}（并发对话）  "
+        f"rounds={rounds}（每路问答轮数）  合计最多 {total} 次  "
+        f"duration={duration or 'off'}s  cache_mode={cache_mode}"
+    )
+    if fd_limit:
+        print(f"   fd limit : {fd_limit}")
+    print(f"   chat      : {base_urls['chat']}")
+    print(f"   responses : {base_urls['responses']}")
+    print(f"   messages  : {base_urls['messages']}")
+    print(f"   models    : {', '.join(models)}")
+    print(f"   formats   : {', '.join(formats)}")
+    print(f"   session   : {session_desc}")
+    print(f"   cache     : {cache_flow}")
+    print(f"   retries   : {retries}  timeout={timeout}s  delay={retry_delay}s")
+    prefix_tokens = estimate_tokens(system_text)
+    print(
+        f"   system    : {system}  {len(system_text)} 字 / {prefix_tokens} token  "
+        f"首轮约 {prefix_tokens + estimate_tokens(prompt)} token"
+    )
+    print(f"   prompt    : {prompt[:50]}{'...' if len(prompt) > 50 else ''}")
+    print(f"   max_tokens: {max_tokens}")
+    print("   画面      : 像 top 清屏。work=一路对话，--round=这一路当前第几次问答")
+    if hit_cache and prefix_tokens < 2048:
+        print(
+            f"⚠️ cache_mode=hit 但 system 只有 {prefix_tokens} token，"
+            "多数服务要 1024+ 才缓存。请用 --system long。"
+        )
+    print(f"{'═' * 88}")
 
 
 def bench(
@@ -182,43 +184,12 @@ def bench(
     verbose: bool = False,
     cache_mode: str = "hit",
 ):
-    """开 workers 个线程，每路都是连续对话，测 cache / TTFT / token/s。
+    """workers 路并发对话；每路 rounds 轮「用户输入 → 模型输出」。
 
-    每个线程是一路正常多轮聊天，成功后把回复和下一条用户消息追加进去。
-      --cache_mode hit   要缓存：本路 session 一直带着，system 前缀不变。
-      --cache_mode miss  不要缓存：不带 session，并且每次在 prompt 最前面换新盐。
-
-    遇到 429 Too many pending requests 时会立刻收缩在途上限并重试。
-
-    Args:
-        models: 模型名列表（逗号分隔）
-        formats: 格式列表（chat / responses / messages）
-        base_url: 三种格式的公共默认接入点
-        chat_base_url: chat 独立接入点，未传则回退 base_url
-        responses_base_url: responses 独立接入点，未传则回退 base_url
-        messages_base_url: messages 独立接入点，未传则回退 base_url
-        api_key: Bearer token
-        max_tokens: 最大输出 token，默认 500000
-        prompt: 第一轮 user prompt；之后自动追加 followup
-        prompt_file: 从文件读取第一轮 user prompt，可与 prompt 叠加
-        followup: 第二轮起的 user 模板；空则用内置 Continue...
-        rounds: 每路对话的轮数（50 workers × 5 rounds = 250 次），不是全局一共几枪
-        throttle: 拿到在途名额后的短暂等待秒数
-        system: short（不填充）或 long（填充到 input_tokens，便于测缓存）
-        system_prompt: 自定义 system 文本，覆盖内置短提示
-        system_file: 从文件读取 system，叠在 system_prompt 前
-        input_tokens: system=long 时的目标输入 token
-        context_file: 可选长上下文文件，叠在 system 最前面；不传则不加任何内置语料
-        session_id: 仅用于日志展示；hit 模式下每路对话使用自己的稳定 ID
-        retries: 流传输中断时的最大重试次数
-        retry_delay: 重试初始等待秒数（指数退避）
-        timeout: 单次流式请求超时秒数
-        workers: 对话线程数 / 最大在途上限，默认 1，可用 --workers 或 LLM_WORKERS 改
-        duration: 压测秒数；0 表示跑完 rounds
-        report_every: 多路并发时的 RPM/TPM 心跳间隔；workers=1 时忽略，改为一轮一行
-        verbose: 多路并发时是否打印每一轮；workers=1 默认就会打印每一轮
-        cache_mode: hit（粘 session + 固定前缀）或 miss（不带 session + 每轮打散前缀）
+      --cache_mode hit   本路 session 一直带着，前缀固定。
+      --cache_mode miss  不带 session，每轮打散前缀。
     """
+    del report_every, verbose
     models, formats, base_urls, api_key, initial_session = _prepare(
         models,
         formats,
@@ -243,74 +214,27 @@ def bench(
     )
     workers = max(int(workers), 1)
     duration = max(float(duration), 0.0)
-    report_every = max(float(report_every), 0.5)
-    request_tokens = estimate_tokens(system_text) + estimate_tokens(prompt)
     fd_limit = raise_fd_limit(workers * 8 + 256)
     configure_pool(workers)
-
-    print(f"\n{'═' * 100}")
-    if hit_cache:
-        title = "LLM Bench · 连续对话（要缓存）"
-        worker_desc = (
-            f"{workers} 路 work1..work{workers}，每路 {rounds} 轮，"
-            f"合计 {workers * max(int(rounds), 0)} 次；本路 session 一直不变"
-        )
-        session_desc = f"每路钉死一条 session_id（示例 {initial_session}）"
-        cache_flow = (
-            "带 session / prompt_cache_key；system 前缀固定。"
-            "第 1 轮冷启，第 2 轮起应对上同一前缀"
-        )
-    else:
-        title = "LLM Bench · 连续对话（不要缓存）"
-        worker_desc = (
-            f"{workers} 路 work1..work{workers}，每路 {rounds} 轮，"
-            f"合计 {workers * max(int(rounds), 0)} 次；不带 session，每轮打散前缀"
-        )
-        session_desc = "不发送 session_id / prompt_cache_key"
-        cache_flow = (
-            "不带 session；每次在 system 最前面插入新的 CACHE_BYPASS 盐，"
-            "从 token 0 打断 prefix cache（只去掉 session 不够）"
-        )
-    print(
-        f"🚀 {title}  "
-        f"rounds={rounds}  duration={duration or 'off'}s  workers={workers}  cache_mode={cache_mode}"
+    _print_start(
+        hit_cache=hit_cache,
+        workers=workers,
+        rounds=rounds,
+        duration=duration,
+        cache_mode=cache_mode,
+        fd_limit=fd_limit,
+        base_urls=base_urls,
+        models=models,
+        formats=formats,
+        initial_session=initial_session,
+        retries=retries,
+        retry_delay=retry_delay,
+        timeout=timeout,
+        system=system,
+        system_text=system_text,
+        prompt=prompt,
+        max_tokens=max_tokens,
     )
-    print(f"   workers  : {worker_desc}")
-    if fd_limit:
-        print(f"   fd limit : {fd_limit}")
-    print(f"   chat base      : {base_urls['chat']}")
-    print(f"   responses base : {base_urls['responses']}")
-    print(f"   messages base  : {base_urls['messages']}")
-    print(f"   models   : {', '.join(models)}")
-    print(f"   formats  : {', '.join(formats)}")
-    print(f"   session  : {session_desc}")
-    print(f"   retries  : {retries} (initial delay: {retry_delay}s)")
-    print(f"   timeout  : {timeout}s")
-    per_round = True
-    use_live = workers <= 1
-    use_ticker = workers > 1 and report_every > 0
-    if use_live:
-        print("   report   : work1 当前轮原地刷新；结束打完整一行，并写 report.md")
-    else:
-        print("   report   : 完成一轮打一行 workN；底部 2 行原地显示在途 out/tok/s，不刷屏")
-    print(f"   cache flow: {cache_flow}")
-    prefix_tokens = estimate_tokens(system_text)
-    print(
-        f"   system   : {system}（{len(system_text)} 字符 / {prefix_tokens} token，"
-        f"首轮约 {request_tokens} token）"
-    )
-    print(f"   prompt   : {prompt[:50]}{'...' if len(prompt) > 50 else ''}")
-    print(f"   max_tokens: {max_tokens}")
-    if hit_cache and prefix_tokens < 2048:
-        print(
-            f"⚠️ cache_mode=hit 但 system 前缀只有 {prefix_tokens} token。"
-            "多数 Prompt Cache 要 1024~4096 token 才开始命中，"
-            "短前缀时 cache% 会一直很低。测缓存请用默认 --system long，"
-            "或加大 --input_tokens。"
-        )
-    elif hit_cache:
-        print("   说明    : 每路第 1 轮是冷启（cache≈0），从第 2 轮起同一前缀才会命中")
-    print(f"{'═' * 100}")
 
     summary: dict = {}
     snapshots: dict = {}
@@ -318,187 +242,38 @@ def bench(
     for format_name in formats:
         protocol = PROTOCOLS[format_name]
         protocol_base = base_urls[format_name]
-        print(f"\n{'█' * 100}")
-        print(f"📦 格式 [{format_name}] {protocol.name}")
-        print(f"   endpoint : {protocol_base}{protocol.endpoint}")
-        print(f"{'█' * 100}")
-
         for model in models:
-            print(f"\n📌 model = {model}")
-            if hit_cache:
-                print("   cache: hit · 粘 session + 固定前缀（第 2 轮起应高 cache%、更低 TTFT）")
-            else:
-                print("   cache: miss · 无 session + 每轮打散前缀（cache% 应≈0，TTFT 应更高）")
-            print(
-                f"   画面: 像 top 清屏刷新。work=并发对话，"
-                f"每个 work 下面只显示当前 --round（每路共 {rounds} 轮问答）。",
-                flush=True,
+            print(f"\n▶ {format_name}  {protocol_base}{protocol.endpoint}  model={model}")
+            rows, stats, gate = run_pool(
+                workers=workers,
+                turns=int(rounds),
+                duration=duration,
+                system=system_text,
+                user=prompt,
+                followup=followup_text,
+                cache=hit_cache,
+                session_prefix=initial_session or "llm-bench",
+                protocol=protocol,
+                base_url=protocol_base,
+                api_key=api_key,
+                model=model,
+                max_tokens=max_tokens,
+                timeout=timeout,
+                retries=retries,
+                retry_delay=retry_delay,
+                throttle=throttle,
             )
-
-            rows: list[dict] = []
-            stats = StressStats(workers=workers)
-            gate = AdaptiveGate(workers)
-            stop = threading.Event()
-            turns = max(int(rounds), 1)
-            board = WorkerBoard(workers, rounds=turns)
-            footer = LiveFooter(stats=stats, board=board, gate=gate)
-            error_shown = 0
-
-            def store(result: dict) -> dict:
-                slim = dict(result)
-                text = slim.pop("text", None) or ""
-                slim["snippet"] = " ".join(str(text).split())[:80]
-                return slim
-
-            def emit_error(index: int, mark: str, exc: Exception, *, worker=1, turn=1) -> None:
-                nonlocal error_shown
-                board.update(
-                    worker,
-                    phase="error",
-                    turn=turn,
-                    error=f"{mark} {exc}"[:80],
-                )
-                error_shown += 1
-
-            def worker(wid: int) -> None:
-                conversation = Conversation(
-                    wid,
-                    system=system_text,
-                    user=prompt,
-                    cache=hit_cache,
-                    session_prefix=initial_session or "llm-bench",
-                    followup=followup_text,
-                )
-                worker_no = wid + 1
-                for turn_no in range(1, turns + 1):
-                    if stop.is_set():
-                        return
-                    progress = board.on_progress(worker_no, turn_no)
-                    board.update(
-                        worker_no,
-                        phase="wait",
-                        turn=turn_no,
-                        out_tokens=0,
-                        tok_s=0.0,
-                        error="",
-                        started=time.perf_counter(),
-                    )
-                    while not stop.is_set():
-                            if not gate.acquire(stop):
-                                return
-                            stats.begin()
-                            try:
-                                if throttle:
-                                    time.sleep(throttle)
-                                result = _turn_request(
-                                    protocol=protocol,
-                                    base_url=protocol_base,
-                                    api_key=api_key,
-                                    model=model,
-                                    conversation=conversation,
-                                    max_tokens=max_tokens,
-                                    timeout=timeout,
-                                    retries=retries,
-                                    retry_delay=retry_delay,
-                                    on_progress=progress,
-                                )
-                            except HttpStatusError as exc:
-                                if exc.rate_limited or exc.capacity_limited:
-                                    if exc.rate_limited:
-                                        stats.note_429()
-                                        gate.release(rate_limited=True)
-                                        mark = "⚠️429"
-                                    else:
-                                        stats.note_unavailable()
-                                        gate.release(rate_limited=False)
-                                        mark = "⚠️5xx"
-                                    emit_error(
-                                        turn_no, mark, exc, worker=worker_no, turn=turn_no
-                                    )
-                                    time.sleep(
-                                        exc.retry_after if exc.retry_after is not None else retry_delay
-                                    )
-                                    continue
-                                stats.fail()
-                                gate.release(rate_limited=False)
-                                emit_error(
-                                    turn_no, "❌", exc, worker=worker_no, turn=turn_no
-                                )
-                                break
-                            except Exception as exc:
-                                stats.fail()
-                                gate.release(rate_limited=False)
-                                emit_error(
-                                    turn_no, "❌", exc, worker=worker_no, turn=turn_no
-                                )
-                                break
-                            else:
-                                conversation.commit(result.get("text") or "")
-                                stats.succeed(result)
-                                gate.release(rate_limited=False)
-                                slim = store(result)
-                                slim["worker"] = worker_no
-                                slim["turn"] = turn_no
-                                inp = int(slim.get("input_tokens") or 0)
-                                cached = int(slim.get("cached_tokens") or 0)
-                                cache_pct = (100.0 * cached / inp) if inp > 0 else None
-                                board.update(
-                                    worker_no,
-                                    phase="idle",
-                                    turn=turn_no,
-                                    done=turn_no,
-                                    out_tokens=int(slim.get("output_tokens") or 0),
-                                    tok_s=float(slim.get("output_tps") or 0),
-                                    input_tokens=inp,
-                                    cached_tokens=cached,
-                                    cache_percent=cache_pct,
-                                    cache_turn=turn_no,
-                                    started=None,
-                                )
-                                with _print_lock:
-                                    rows.append(slim)
-                                break
-            reporter = None
-            footer.start()
-            try:
-                with ThreadPoolExecutor(
-                    max_workers=workers,
-                    thread_name_prefix="llm-bench",
-                ) as pool:
-                    futures = [pool.submit(worker, i) for i in range(workers)]
-                    try:
-                        if duration > 0:
-                            deadline = time.monotonic() + duration
-                            while time.monotonic() < deadline and any(
-                                not future.done() for future in futures
-                            ):
-                                time.sleep(0.2)
-                            stop.set()
-                        for future in as_completed(futures):
-                            future.result()
-                    except KeyboardInterrupt:
-                        stop.set()
-                        print("\n⏹ 收到中断，等待在途请求结束后输出统计", flush=True)
-            finally:
-                stop.set()
-                if footer is not None:
-                    footer.stop()
-                if reporter is not None:
-                    reporter.stop()
-                    reporter.emit()
-
             snap = stats.snapshot()
             snapshots[(format_name, model)] = snap
             print_stress_summary(snap, limit=gate.limit, show_cache=hit_cache)
             if not hit_cache and snap.ok and snap.cache_percent > 5:
                 print(
-                    f"⚠️ cache_mode=miss 已打散前缀但仍有 {snap.cache_percent:.1f}% 缓存命中，"
-                    "上游可能按语义或其它键缓存"
+                    f"⚠️ cache_mode=miss 已打散前缀但仍有 {snap.cache_percent:.1f}% 命中"
                 )
             if not rows:
-                print("⚠️ 本模型没有成功样本，不生成延迟统计")
+                print("⚠️ 没有成功样本")
                 continue
-            print(f"   有效样本: {len(rows)}/{rounds}")
+            print(f"   有效问答: {len(rows)}（{workers} 路 × 每路最多 {rounds} 轮）")
             summary[(format_name, model)] = rows
             print_model_average(rows, show_cache=hit_cache)
             print_token_totals(rows, show_cache=hit_cache)
@@ -546,11 +321,7 @@ def cache(
     retries: int = 2,
     retry_delay: float = 1.0,
 ):
-    """缓存命中率诊断：同一路对话、同一 session，观察冷启和稳态。
-
-    Args:
-        参数含义与 bench 相同。默认 --system long，便于看出 R1 冷启 → R2 命中。
-    """
+    """单路缓存诊断：同一对话连问 rounds 轮，看 R1 冷启 → R2 命中。"""
     models, formats, base_urls, api_key, active_session = _prepare(
         models,
         formats,
@@ -571,92 +342,47 @@ def cache(
         context_file=context_file,
         input_tokens=input_tokens,
     )
-    print(f"\n{'═' * 100}")
-    print(f"🚀 LLM Bench · 缓存冷启诊断  rounds={rounds}")
-    print(f"   chat base      : {base_urls['chat']}")
-    print(f"   responses base : {base_urls['responses']}")
-    print(f"   messages base  : {base_urls['messages']}")
-    print(f"   session  : {active_session} (header: session_id)")
-    print(f"   retries  : {retries} (initial delay: {retry_delay}s)")
-    print(
-        f"   system   : {system} (~{len(system_text)} 字符 / "
-        f"{estimate_tokens(system_text)} token)"
-    )
-    print(f"   方式     : 同一路对话重复 {rounds} 轮，R1 冷启动，R2+ 应命中")
-    print(f"{'═' * 100}")
-
+    configure_pool(1)
+    print(f"\n{'═' * 88}")
+    print(f"LLM Bench · 缓存冷启诊断  1 路对话 × {rounds} 轮问答")
+    print(f"   responses : {base_urls['responses']}")
+    print(f"   session   : {active_session}")
+    print(f"{'═' * 88}")
     for format_name in formats:
         protocol = PROTOCOLS[format_name]
         protocol_base = base_urls[format_name]
-        print(f"\n{'█' * 100}")
-        print(
-            f"📦 格式 [{format_name}] {protocol.name}  —  "
-            f"{protocol_base}{protocol.endpoint}"
-        )
-        print(f"{'█' * 100}")
         for model in models:
             model_session = session.configure(
                 session.scoped(active_session, format_name, model)
             )
-            conversation = Conversation(
-                0,
+            print(f"\n▶ {format_name}  {model}  session={model_session}")
+            rows, stats, gate = run_pool(
+                workers=1,
+                turns=int(rounds),
+                duration=0,
                 system=system_text,
                 user=prompt,
+                followup=followup_text,
                 cache=True,
                 session_prefix=model_session,
-                followup=followup_text,
+                protocol=protocol,
+                base_url=protocol_base,
+                api_key=api_key,
+                model=model,
+                max_tokens=max_tokens,
+                timeout=180,
+                retries=retries,
+                retry_delay=retry_delay,
+                throttle=throttle,
             )
-            conversation.session_id = model_session
-            print(f"\n📌 model = {model}")
-            print(f"   cache key/session: {model_session}")
-            print(
-                f"{'轮':<3}{'TTFT':>10}{'tok/s':>9}{'E2E':>10}{'input':>8}"
-                f"{'cached':>9}{'命中率':>9}{'out':>7}"
-            )
-            separator()
-            rows = []
-            for index in range(1, int(rounds) + 1):
-                live = RoundLiveDisplay(index, worker=1, turn=index)
-                live.start()
-                try:
-                    result = _turn_request(
-                        protocol=protocol,
-                        base_url=protocol_base,
-                        api_key=api_key,
-                        model=model,
-                        conversation=conversation,
-                        max_tokens=max_tokens,
-                        timeout=180,
-                        retries=retries,
-                        retry_delay=retry_delay,
-                        on_progress=live.on_progress,
-                    )
-                    conversation.commit(result.get("text") or "")
-                    retry_mark = (
-                        f"  [retry={result['retry_count']}, session={result['session_id']}]"
-                        if result["retry_count"] else ""
-                    )
-                    live.finish(
-                        f"{index:<3}{format_ms(result['ttft_ms'])}"
-                        f"{format_tps(result.get('output_tps'))}"
-                        f"{format_ms(result['e2e_ms'])}"
-                        f"{result['input_tokens']:>8}{result['cached_tokens']:>9}"
-                        f"{cache_percent(result):>9}{result['output_tokens']:>7}"
-                        f"{retry_mark}"
-                    )
-                    rows.append(result)
-                except Exception as exc:
-                    live.finish()
-                    print(f"{index:<3}❌ {exc}", flush=True)
-                time.sleep(throttle)
+            print_stress_summary(stats.snapshot(), limit=gate.limit, show_cache=True)
             if not rows:
-                print("❌ 该模型该格式全部请求失败")
+                print("❌ 全部失败")
                 continue
-            separator()
             steady = rows[1:]
             print(
-                f"📊 首轮(冷启)={cache_percent(rows[0])}  "
-                f"稳态(≥2轮)={aggregate_cache_percent(steady) if steady else '   n/a  '}  "
+                f"📊 第1轮(冷启)={cache_percent(rows[0])}  "
+                f"第2轮起={aggregate_cache_percent(steady) if steady else 'n/a'}  "
                 f"整体={aggregate_cache_percent(rows)}"
             )
     print()

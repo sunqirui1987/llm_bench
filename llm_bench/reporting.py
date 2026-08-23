@@ -152,6 +152,37 @@ class WorkerBoard:
             for i in range(1, self.workers + 1)
         }
 
+    def begin_round(self, worker: int, turn: int) -> None:
+        self.update(
+            worker,
+            phase="wait",
+            turn=int(turn),
+            out_tokens=0,
+            tok_s=0.0,
+            error="",
+            started=time.perf_counter(),
+        )
+
+    def fail_round(self, worker: int, turn: int, error: str) -> None:
+        self.update(worker, phase="error", turn=int(turn), error=str(error)[:80])
+
+    def finish_round(self, worker: int, turn: int, result: dict) -> None:
+        inp = int(result.get("input_tokens") or 0)
+        cached = int(result.get("cached_tokens") or 0)
+        self.update(
+            worker,
+            phase="idle",
+            turn=int(turn),
+            done=int(turn),
+            out_tokens=int(result.get("output_tokens") or 0),
+            tok_s=float(result.get("output_tps") or 0),
+            input_tokens=inp,
+            cached_tokens=cached,
+            cache_percent=(100.0 * cached / inp) if inp > 0 else None,
+            cache_turn=int(turn),
+            started=None,
+        )
+
     def update(self, worker: int, **fields) -> None:
         worker = max(int(worker), 1)
         with self._lock:
@@ -275,33 +306,37 @@ class WorkerBoard:
             err = (state.get("error") or "").strip()
             name = worker_label(worker)
             cache_bit = _round_cache_label(state, turn)
+            inp = int(state.get("input_tokens") or 0)
             lines.append(f"{name}")
+            prefix = f"  └─ --round{turn}/{total}"
             if phase == "stream":
-                first = f"  首字 {ttft / 1000:.1f}s" if ttft is not None else ""
+                first = f" · 首字 {ttft / 1000:.1f}s" if ttft is not None else ""
                 lines.append(
-                    f"  └─ --round{turn}/{total}  模型正在输出  "
-                    f"{out_tokens} token  {tok_s:.1f} tok/s{first}  {cache_bit}"
+                    f"{prefix}  [模型正在输出]  "
+                    f"已吐 {out_tokens} token · {tok_s:.1f} tok/s · 本轮已 {elapsed:.0f}s"
+                    f"{first}  ·  {cache_bit}"
                 )
             elif phase == "wait":
                 lines.append(
-                    f"  └─ --round{turn}/{total}  用户已输入，等待模型  "
-                    f"已等 {elapsed:.0f}s  {cache_bit}"
+                    f"{prefix}  [等待模型首字]  "
+                    f"用户输入已发出 · 已等 {elapsed:.0f}s  ·  {cache_bit}"
                 )
             elif phase == "error":
                 lines.append(
-                    f"  └─ --round{turn}/{total}  出错  {err[:60]}  {cache_bit}"
+                    f"{prefix}  [请求失败]  {err[:70]}  ·  {cache_bit}"
+                )
+            elif done >= total:
+                io_bit = f"输入 {inp} → 输出 {out_tokens}  ·  " if inp or out_tokens else ""
+                lines.append(
+                    f"  └─ --round{done}/{total}  [全部轮次结束]  {io_bit}{cache_bit}"
+                )
+            elif done:
+                io_bit = f"输入 {inp} → 输出 {out_tokens}  ·  " if inp or out_tokens else ""
+                lines.append(
+                    f"  └─ --round{done}/{total}  [本轮问答结束]  {io_bit}{cache_bit}"
                 )
             else:
-                if done >= total:
-                    lines.append(
-                        f"  └─ --round{done}/{total}  已全部聊完  {cache_bit}"
-                    )
-                elif done:
-                    lines.append(
-                        f"  └─ --round{done}/{total}  本轮结束  {cache_bit}"
-                    )
-                else:
-                    lines.append(f"  └─ 尚未开始")
+                lines.append(f"  └─ --round1/{total}  [尚未开始]  还没发出用户输入")
         return lines
 
 
@@ -377,7 +412,10 @@ class LiveFooter:
             f"{first}  ·  正在输出合计 {live['out_tokens']} token  ·  "
             f"{live['tok_s']:.1f} tok/s"
         )
-        hint = "每个 work 是一路并发对话；下面只显示这一路最新的一轮（用户输入 → 模型输出）。"
+        hint = (
+            "work = 并发对话。--round = 这一路当前第几次问答（用户输入 → 等模型 → 模型输出）。"
+            "每路只显示最新一轮在做什么。"
+        )
         rule = "─" * 88
         return [title, stats, hint, rule, *self.board.worker_lines()]
 
