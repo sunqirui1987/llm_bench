@@ -25,7 +25,7 @@ class FakeResponse:
 
     def iter_lines(self, **kwargs):
         self.test_case.assertEqual(
-            kwargs, {"chunk_size": 1, "decode_unicode": False}
+            kwargs, {"chunk_size": 256, "decode_unicode": False}
         )
         return iter(line.encode() for line in self.lines)
 

@@ -1,23 +1,25 @@
-"""每个压测线程对应一路普通多轮对话。"""
+"""一路线程一次请求。hit：同一条命令原样再发；miss：每次都换一条新命令。"""
 
 from __future__ import annotations
 
 import uuid
 
 from .prompts import (
-    build_followup_prompt,
-    build_user_prompt,
+    CONTEXT_WINDOW,
+    build_hit_user,
+    build_miss_user,
     bust_prefix,
-    clip_text,
-    trim_messages,
+    clamp_output_tokens,
+    estimate_tokens,
+    pad_to_tokens,
 )
 
 
 class Conversation:
-    """一路连续对话：成功后把回复和下一条用户消息追加进去。
+    """一个 worker 在某一波里发出的那一条命令。
 
-    cache=True  钉死 session_id，system 前缀保持不变，让 Prompt Cache 能命中。
-    cache=False 不带 session，每次 outbound 都在 system 最前面换新盐，强制不命中。
+    cache=True  冻结 [system, user]，每一波字节完全相同，session 钉死。
+    cache=False 每一次 outbound 都换新盐、换一场戏，不带 session。
     """
 
     def __init__(
@@ -29,47 +31,78 @@ class Conversation:
         cache: bool,
         session_prefix: str = "llm-bench",
         followup: str = "",
+        max_input: int = 0,
+        max_tokens: int = 500000,
+        context_window: int = CONTEXT_WINDOW,
+        pad: bool | None = None,
+        full_prefix: str | None = None,
+        full_tokens: int | None = None,
     ):
         self.worker_id = int(worker_id)
         self.cache = bool(cache)
+        self.user_template = user or ""
         self.followup = followup or ""
         self.uid = uuid.uuid4().hex[:12]
         self.session_id = (
-            f"{session_prefix}-w{self.worker_id:03d}-{self.uid}" if self.cache else ""
+            f"{session_prefix}-w{self.worker_id:03d}" if self.cache else ""
         )
-        self.turn = 0
-        self.messages: list[dict[str, str]] = [
-            {"role": "system", "content": system},
-            {
-                "role": "user",
-                "content": build_user_prompt(user, worker_id=self.worker_id, uid=self.uid),
-            },
-        ]
+        self.max_input = max(int(max_input), 0)
+        self.max_tokens = max(int(max_tokens), 1)
+        self.context_window = max(int(context_window), 1)
+        self.seq = 0
+        should_pad = bool(self.max_input) if pad is None else bool(pad)
+        if full_prefix:
+            self.full_prefix = full_prefix
+        elif should_pad and self.max_input:
+            self.full_prefix = pad_to_tokens(
+                system or "",
+                self.max_input,
+                salt=session_prefix if self.cache else f"miss-{self.uid}",
+                domain="宿命旅途",
+            )
+        else:
+            self.full_prefix = system or ""
+        self.full_tokens = (
+            max(int(full_tokens), 1)
+            if full_tokens
+            else max(estimate_tokens(self.full_prefix), 1)
+        )
+        self._frozen: list[dict[str, str]] | None = None
+        if self.cache:
+            self._frozen = [
+                {"role": "system", "content": self.full_prefix},
+                {
+                    "role": "user",
+                    "content": build_hit_user(self.user_template, extra=self.followup),
+                },
+            ]
+
+    def input_tokens_for(self) -> int:
+        return max(self.full_tokens, 1)
+
+    def output_tokens_for(self) -> int:
+        return clamp_output_tokens(
+            self.input_tokens_for(),
+            self.max_tokens,
+            self.context_window,
+        )
 
     def outbound(self) -> list[dict[str, str]]:
-        messages = [
-            {"role": item["role"], "content": item["content"]} for item in self.messages
-        ]
-        if self.cache or not messages:
-            return messages
-        if messages[0]["role"] == "system":
-            messages[0]["content"] = bust_prefix(messages[0]["content"])
-        else:
-            messages.insert(0, {"role": "system", "content": bust_prefix("")})
-        return messages
-
-    def commit(self, assistant_text: str) -> None:
-        self.messages.append(
-            {
-                "role": "assistant",
-                "content": clip_text(assistant_text) or "(empty reply; continue.)",
-            }
-        )
-        self.turn += 1
-        self.messages.append(
+        if self.cache and self._frozen is not None:
+            return [
+                {"role": item["role"], "content": item["content"]}
+                for item in self._frozen
+            ]
+        self.seq += 1
+        return [
+            {"role": "system", "content": bust_prefix(self.full_prefix)},
             {
                 "role": "user",
-                "content": build_followup_prompt(self.turn, self.followup),
-            }
-        )
-        trim_messages(self.messages)
+                "content": build_miss_user(
+                    self.user_template,
+                    worker_id=self.worker_id,
+                    seq=self.seq,
+                    extra=self.followup,
+                ),
+            },
+        ]

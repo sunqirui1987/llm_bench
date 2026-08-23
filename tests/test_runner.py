@@ -1,4 +1,4 @@
-"""连续对话压测：session 开/关与缓存诊断。"""
+"""同一条命令再发 vs 每次新命令。"""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import unittest
 from llm_bench import session
 from llm_bench.config import parse_cache_mode
 from llm_bench.conversation import Conversation
+from llm_bench.engine import run_pool
 from llm_bench.runner import _turn_request, bench
 from llm_bench.transport import configure_pool, raise_fd_limit
 
@@ -27,6 +28,36 @@ def result(cache_percent: float) -> dict:
     }
 
 
+class CaptureProtocol:
+    def __init__(self):
+        self.captured = []
+        self.endpoint = "/v1/responses"
+
+    def stream(
+        self,
+        base_url,
+        api_key,
+        model,
+        system,
+        user,
+        max_tokens,
+        timeout=180,
+        messages=None,
+        session_id="",
+        on_progress=None,
+    ):
+        self.captured.append(
+            {
+                "messages": messages,
+                "session_id_arg": session_id,
+                "max_tokens": max_tokens,
+            }
+        )
+        payload = result(80 if session_id else 0)
+        payload["session_id"] = session_id
+        return payload
+
+
 class RunnerTest(unittest.TestCase):
     def test_parse_cache_mode_aliases(self):
         self.assertEqual(parse_cache_mode("miss"), "miss")
@@ -36,49 +67,26 @@ class RunnerTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_cache_mode("maybe")
 
-    def test_bench_defaults_to_hit_cache_mode(self):
-        self.assertEqual(inspect.signature(bench).parameters["cache_mode"].default, "hit")
-        self.assertEqual(inspect.signature(bench).parameters["system"].default, "long")
-        self.assertEqual(inspect.signature(bench).parameters["formats"].default, "responses")
-        self.assertEqual(inspect.signature(bench).parameters["max_tokens"].default, 500000)
+    def test_bench_defaults(self):
+        params = inspect.signature(bench).parameters
+        self.assertEqual(params["cache_mode"].default, "hit")
+        self.assertEqual(params["system"].default, "long")
+        self.assertEqual(params["formats"].default, "responses")
+        self.assertEqual(params["max_tokens"].default, 500000)
+        self.assertEqual(params["rounds"].default, 2)
+        self.assertNotIn("steps", params)
+        self.assertEqual(params["workers"].default, 1)
 
     def test_bench_defaults_to_one_worker(self):
-        self.assertEqual(inspect.signature(bench).parameters["workers"].default, 1)
         self.assertEqual(configure_pool(16), 16)
         limit = raise_fd_limit(1024)
         self.assertTrue(limit == 0 or limit >= 1024)
 
-    def test_hit_turn_keeps_session_across_commits(self):
-        captured = []
-
-        class CaptureProtocol:
-            @staticmethod
-            def stream(
-                base_url,
-                api_key,
-                model,
-                system,
-                user,
-                max_tokens,
-                timeout=180,
-                messages=None,
-                session_id="",
-                on_progress=None,
-            ):
-                captured.append(
-                    {
-                        "messages": messages,
-                        "session_id_arg": session_id,
-                        "max_tokens": max_tokens,
-                    }
-                )
-                payload = result(80)
-                payload["session_id"] = session_id
-                return payload
-
+    def test_hit_resends_the_same_command(self):
+        protocol = CaptureProtocol()
         conv = Conversation(0, system="sys", user="hello", cache=True)
         first = _turn_request(
-            protocol=CaptureProtocol,
+            protocol=protocol,
             base_url="https://example.test",
             api_key="key",
             model="model",
@@ -88,9 +96,8 @@ class RunnerTest(unittest.TestCase):
             retries=0,
             retry_delay=0,
         )
-        conv.commit("ok")
         second = _turn_request(
-            protocol=CaptureProtocol,
+            protocol=protocol,
             base_url="https://example.test",
             api_key="key",
             model="model",
@@ -100,15 +107,45 @@ class RunnerTest(unittest.TestCase):
             retries=0,
             retry_delay=0,
         )
+        captured = protocol.captured
         self.assertEqual(len(captured), 2)
         self.assertEqual(captured[0]["session_id_arg"], conv.session_id)
         self.assertEqual(captured[1]["session_id_arg"], conv.session_id)
-        self.assertTrue(conv.session_id)
-        self.assertGreater(len(captured[1]["messages"]), len(captured[0]["messages"]))
+        self.assertEqual(captured[0]["messages"], captured[1]["messages"])
         self.assertEqual(first["session_id"], conv.session_id)
         self.assertEqual(second["session_id"], conv.session_id)
-        self.assertEqual(captured[0]["messages"][0]["content"], "sys")
-        self.assertEqual(captured[1]["messages"][0]["content"], "sys")
+
+    def test_miss_sends_a_new_command_and_no_session(self):
+        protocol = CaptureProtocol()
+        conv = Conversation(0, system="sys", user="hello", cache=False)
+        _turn_request(
+            protocol=protocol,
+            base_url="https://example.test",
+            api_key="key",
+            model="model",
+            conversation=conv,
+            max_tokens=64,
+            timeout=30,
+            retries=0,
+            retry_delay=0,
+        )
+        _turn_request(
+            protocol=protocol,
+            base_url="https://example.test",
+            api_key="key",
+            model="model",
+            conversation=conv,
+            max_tokens=64,
+            timeout=30,
+            retries=0,
+            retry_delay=0,
+        )
+        captured = protocol.captured
+        self.assertEqual(conv.session_id, "")
+        self.assertEqual(captured[0]["session_id_arg"], "")
+        self.assertEqual(captured[1]["session_id_arg"], "")
+        self.assertNotEqual(captured[0]["messages"], captured[1]["messages"])
+        self.assertTrue(captured[0]["messages"][0]["content"].startswith("CACHE_BYPASS"))
 
     def test_write_report_groups_by_worker(self):
         import tempfile
@@ -119,6 +156,7 @@ class RunnerTest(unittest.TestCase):
         rows = [
             {
                 "worker": 1,
+                "wave": 1,
                 "turn": 1,
                 "ttft_ms": 100.0,
                 "output_tps": 40.0,
@@ -130,6 +168,7 @@ class RunnerTest(unittest.TestCase):
             },
             {
                 "worker": 2,
+                "wave": 1,
                 "turn": 1,
                 "ttft_ms": 80.0,
                 "output_tps": 50.0,
@@ -150,6 +189,7 @@ class RunnerTest(unittest.TestCase):
                     "models": ["demo"],
                     "cache_mode": "hit",
                     "workers": 2,
+                    "rounds": 2,
                     "system": "long",
                     "base_url": "http://127.0.0.1:8080",
                 },
@@ -159,65 +199,80 @@ class RunnerTest(unittest.TestCase):
         self.assertIn("work1", text)
         self.assertIn("work2", text)
         self.assertIn("cache_mode: hit", text)
+        self.assertIn("第 1 次命令", text)
+        self.assertNotIn("steps:", text)
 
-    def test_miss_turn_sends_no_session(self):
-        captured = []
+    def test_write_report_includes_full_output_text(self):
+        import tempfile
+        from pathlib import Path
 
-        class CaptureProtocol:
-            @staticmethod
-            def stream(
-                base_url,
-                api_key,
-                model,
-                system,
-                user,
-                max_tokens,
-                timeout=180,
-                messages=None,
-                session_id="",
-                on_progress=None,
-            ):
-                captured.append({"session_id_arg": session_id, "messages": messages})
-                payload = result(0)
-                payload["session_id"] = session_id
-                return payload
+        from llm_bench.reporting import write_report
 
-        conv = Conversation(0, system="sys", user="hello", cache=False)
-        first = _turn_request(
-            protocol=CaptureProtocol,
+        rows = [
+            {
+                "worker": 1,
+                "wave": 1,
+                "ttft_ms": 10.0,
+                "output_tps": 20.0,
+                "e2e_ms": 30.0,
+                "input_tokens": 8,
+                "cached_tokens": 0,
+                "output_tokens": 4,
+                "cache_reported": True,
+                "text": "full model output body",
+            }
+        ]
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "report.md"
+            write_report(
+                path,
+                meta={
+                    "started_at": "2026-01-01 00:00:00",
+                    "formats": ["responses"],
+                    "models": ["demo"],
+                    "cache_mode": "hit",
+                    "workers": 1,
+                    "rounds": 2,
+                    "system": "long",
+                    "base_url": "http://127.0.0.1:8080",
+                },
+                summary={("responses", "demo"): rows},
+            )
+            text = path.read_text(encoding="utf-8")
+        self.assertIn("完整输出:", text)
+        self.assertIn("full model output body", text)
+
+    def test_run_pool_replays_full_worker_set_each_round(self):
+        protocol = CaptureProtocol()
+        rows, stats, _gate = run_pool(
+            workers=2,
+            rounds=2,
+            duration=0,
+            system="sys",
+            user="hello",
+            followup="",
+            cache=True,
+            session_prefix="pool",
+            protocol=protocol,
             base_url="https://example.test",
             api_key="key",
             model="model",
-            conversation=conv,
-            max_tokens=64,
+            max_tokens=32,
             timeout=30,
             retries=0,
             retry_delay=0,
+            throttle=0,
+            max_input=200,
+            context_window=2000,
+            pad=True,
         )
-        conv.commit("ok")
-        second = _turn_request(
-            protocol=CaptureProtocol,
-            base_url="https://example.test",
-            api_key="key",
-            model="model",
-            conversation=conv,
-            max_tokens=64,
-            timeout=30,
-            retries=0,
-            retry_delay=0,
-        )
-        self.assertEqual(conv.session_id, "")
-        self.assertEqual(captured[0]["session_id_arg"], "")
-        self.assertEqual(captured[1]["session_id_arg"], "")
-        self.assertEqual(first["session_id"], "")
-        self.assertEqual(second["session_id"], "")
-        self.assertGreater(len(captured[1]["messages"]), len(captured[0]["messages"]))
-        self.assertTrue(captured[0]["messages"][0]["content"].startswith("CACHE_BYPASS"))
-        self.assertTrue(captured[1]["messages"][0]["content"].startswith("CACHE_BYPASS"))
-        self.assertNotEqual(
-            captured[0]["messages"][0]["content"],
-            captured[1]["messages"][0]["content"],
-        )
+        self.assertEqual(len(rows), 4)
+        self.assertEqual(stats.snapshot().ok, 4)
+        self.assertEqual({row["wave"] for row in rows}, {1, 2})
+        self.assertNotIn("step", rows[0])
+        self.assertEqual(len(protocol.captured), 4)
+        bodies = [item["messages"] for item in protocol.captured]
+        self.assertTrue(all(item == bodies[0] for item in bodies))
 
 
 if __name__ == "__main__":

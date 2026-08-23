@@ -1,8 +1,13 @@
 # LLM Bench
 
-测 **TTFT**、**token/s**、**Prompt Cache**。默认协议是 **responses**（流式，当前轮会实时刷新）。
+测 **TTFT**、**token/s**、**Prompt Cache**。默认协议是 **responses**（流式）。
 
-`--cache_mode hit`：粘 session，前缀固定。`miss`：不带 session，每轮打散前缀。
+没有 step。每一波，每个 worker 只发 **一条命令**。
+
+- `--cache_mode hit`：同一条《宿命旅途》开场选角→首通命令，原样再发。粘 session。第 1 次冷启，第 2 次起应对上 cache。
+- `--cache_mode miss`：每一次都是一条新命令（换盐、换区服、换关卡坐标），不带 session。
+
+`--rounds`：全量线程把命令再发几遍。hit 时就是「同样的命令再来」；miss 时每一遍都不同。
 
 ## 配置
 
@@ -16,42 +21,17 @@ LLM_BASE_URL=http://127.0.0.1:8080
 LLM_MODELS=grok-4.6
 ```
 
-## 协议
-
-| `--formats` | 路径 |
-|-------------|------|
-| `responses`（默认） | `/v1/responses` |
-| `chat` | `/v1/chat/completions` |
-| `messages` | `/v1/messages` |
-
-三个地址可分开：`LLM_CHAT_BASE_URL` / `LLM_RESPONSES_BASE_URL` / `LLM_MESSAGES_BASE_URL`。
-
 ## 命令
 
 ```bash
-uv run run.py bench --cache_mode hit --workers 1 --rounds 10
-uv run run.py bench --cache_mode miss --workers 1 --rounds 10
-uv run run.py bench --formats chat,responses,messages --workers 2 --rounds 5
-uv run run.py cache --rounds 5
+uv run run.py bench --cache_mode hit --workers 8 --rounds 2
+uv run run.py bench --cache_mode miss --workers 8 --rounds 2
+uv run run.py cache --rounds 2
 ```
 
-- `--workers`：同时开几路**对话**（并发）
-- `--rounds`：每一路要问答多少轮（输入 → 输出 → 再输入 → 再输出）
+- `--workers`：一波同时开几路线程
+- `--rounds`：同一批线程把命令再发几遍（默认 2：一次冷、一次热）
+- `--input_tokens`：这条命令的输入大小（默认约 43 万）
+- `--max_tokens`：输出上限（默认 50 万，按窗口剩余截断）
 
-屏幕像 `top`：清屏刷新。每个 work 下面只显示**当前这一轮**。跑完写入 `report.md`（按 work 列出每一轮）。
-
-## 常用参数
-
-| 参数 | 默认 |
-|------|------|
-| `--formats` | `responses` |
-| `--cache_mode` | `hit` |
-| `--workers` | `1` |
-| `--max_tokens` | `500000` |
-| `--system` | `long`（约 8k 前缀，测缓存） |
-| `--models` | `LLM_MODELS` |
-| `--base_url` | `LLM_BASE_URL` |
-
-```bash
-uv run run.py bench --help
-```
+控制台每次刷新会**清整屏**，再画出启动横幅和每个 work 一栏。正文写在该 work 下面。全文写入 `logs/` 和 `report.md`。

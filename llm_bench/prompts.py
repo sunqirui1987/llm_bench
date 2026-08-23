@@ -1,4 +1,4 @@
-"""通用压测语料：短延迟、长前缀缓存、自定义对话、多轮追加。"""
+"""压测语料：5 步把输入抬到上限，用户任务按 worker/步骤换题。"""
 
 from __future__ import annotations
 
@@ -7,31 +7,119 @@ import uuid
 from pathlib import Path
 
 
-TARGET_INPUT_TOKENS = 8_192
+CONTEXT_WINDOW = 500_000
+TOKEN_OVERHEAD = 2_048
+DEFAULT_OUTPUT_RESERVE = 65_536
+TARGET_INPUT_TOKENS = CONTEXT_WINDOW - DEFAULT_OUTPUT_RESERVE - TOKEN_OVERHEAD
 HISTORY_TOKEN_BUDGET = 420_000
 ASSISTANT_KEEP_CHARS = 12_000
 UNIQUE_PREFIX_LINES = 16
 
 DEFAULT_SYSTEM = (
-    "You are a precise technical assistant. Answer completely. "
-    "Do not ask whether to continue. Write until you finish or hit the output limit."
+    "你是《宿命旅途》的场景主持人。只用这份档案里的专属设定："
+    "竖屏放置小队卡牌 RPG，队伍最多五人，十五个难度层，每层 23 章、每章 5 关，"
+    "初始伙伴只有卡琳、麦琪、琳达。把当前场景写完整，写到输出上限，不要问是否继续。"
 )
 
 DEFAULT_USER = (
-    "Explain a production-grade design for an LLM inference gateway: "
-    "routing, streaming, prompt cache, retries, backpressure, and observability. "
-    "Include concrete interfaces, failure cases, and tests. Write until the output limit."
+    "请按系统里的《宿命旅途》档案，把下面这场戏从进界面写到首通结算结束。"
+    "不要改设定，不要发明档案里没有的英雄、页签或建筑，不要问是否继续，写到输出上限。\n"
+    "\n"
+    "1. 开始界面，选择区服「雷鸣区」，记下 firstLoginTime。\n"
+    "2. 看完开场情景对话。\n"
+    "3. 从卡琳、麦琪、琳达里选定卡琳，initialHeroId 写入该区服档案，编入 team。\n"
+    "4. 切到战斗页签，进入难度层 1、第 1 章、第 1 关，battleMode 为首通，客户端做自动战斗逐帧演算。\n"
+    "5. 通关申报和切关申报必须分开。申报关卡等于 currentStageId。"
+    "首通只奖一次，写入 clearedStages。\n"
+    "过程里要用到的字段：currentStageId、clearedStages、battleMode、roster、team、"
+    "initialHeroId、firstLoginTime。"
 )
 
 DEFAULT_FOLLOWUP = (
-    "Continue from where you left off. Do not restart or repeat previous text. "
-    "Add the next missing section until the output limit."
+    "从刚才停下的地方继续写这一场，不要重开，不要重复。写到输出上限。"
 )
 
-_PAD_BLOCK = (
-    "This is stable context padding for prompt-cache and TTFT tests. "
-    "It stays identical across turns of the same conversation so a prefix cache can hit. "
-    "block={i:06d} salt={salt}\n"
+WORKER_STARTS = (
+    ("卡琳", "雷鸣区"),
+    ("麦琪", "霜原区"),
+    ("琳达", "暮港区"),
+    ("卡琳", "星砂区"),
+    ("麦琪", "雷鸣区"),
+    ("琳达", "霜原区"),
+    ("卡琳", "暮港区"),
+    ("麦琪", "星砂区"),
+    ("琳达", "雷鸣区"),
+    ("卡琳", "霜原区"),
+    ("麦琪", "暮港区"),
+    ("琳达", "星砂区"),
+    ("卡琳", "北境区"),
+    ("麦琪", "南风区"),
+    ("琳达", "内城区"),
+    ("卡琳", "外环区"),
+)
+WORKER_DOMAINS = tuple(f"{hero}@{zone}" for hero, zone in WORKER_STARTS)
+
+MISS_SCENES = (
+    ("麦琪", "霜原区", 2, 4, 3, "主线自动战斗首通"),
+    ("琳达", "暮港区", 6, 12, 5, "城镇酒馆与铁匠铺"),
+    ("卡琳", "星砂区", 9, 23, 1, "终焉神殿换到下一难度"),
+    ("麦琪", "雷鸣区", 11, 8, 2, "角色页觉醒与遗物四格"),
+    ("琳达", "霜原区", 14, 20, 4, "资源副本与离线挂机结算"),
+    ("卡琳", "暮港区", 3, 1, 5, "教堂天赋星图第一次打开"),
+    ("麦琪", "星砂区", 8, 16, 3, "竞技场入口刚从新手链解锁"),
+    ("琳达", "雷鸣区", 12, 10, 1, "神器子槽按出战位开放"),
+)
+
+_PAD_BLOCKS = (
+    (
+        "【主线坐标 {i:06d}】难度层 {layer} · 第 {chapter} 章 · 第 {stage} 关 · {domain}\n"
+        "salt={salt}\n"
+        "《宿命旅途》主线是难度层、章节、关卡三级坐标。共 15 层、每层 23 章、每章 5 个普通关，"
+        "合计 345 章、1725 个普通关。本段记录 {domain} 在该坐标的自动战斗：客户端逐帧演算，"
+        "服务端只做边界结算。currentStageId 必须等于服务端当前关，clearedStages 未落账不能切关。\n"
+    ),
+    (
+        "【初始伙伴 {i:06d}】{domain}\n"
+        "salt={salt}\n"
+        "开始界面选区服后，新玩家看开场与情景对话，再从卡琳、麦琪、琳达三人中选一名。"
+        "initialHeroId 写入区服档案，不能用其他游戏的英雄名顶替。出战槽随冒险等级开放，队伍最多五人。\n"
+    ),
+    (
+        "【页签 {i:06d}】角色 / 日志 / 战斗 / 城镇 / 副本 · {domain}\n"
+        "salt={salt}\n"
+        "长期导航只有这五个页签。战斗是起始中心；日志、城镇、教堂天赋、酒馆、铁匠铺、"
+        "竞技场和副本沿新手事件链逐步打开，不是一份独立教程列表。\n"
+    ),
+    (
+        "【首通结算 {i:06d}】{domain}\n"
+        "salt={salt}\n"
+        "通关申报和切关申报必须分开。服务端先完成当前关首通，再检查下一关。"
+        "客户端自称更远的进度不能改写服务器正在挑战的位置。battleMode 区分首通与挂机。\n"
+    ),
+    (
+        "【构筑 {i:06d}】装备 / 天赋星图 / 神器 / 遗物 · {domain}\n"
+        "salt={salt}\n"
+        "装备管槽位属性、强化与洗练。天赋是星图。神器按出战位开放子槽。"
+        "遗物用四格形状放进逐步扩展的面板。20 名英雄、6 职业、12 个一转、24 个二转、每名 7 阶觉醒。\n"
+    ),
+    (
+        "【终焉神殿 {i:06d}】{domain}\n"
+        "salt={salt}\n"
+        "前 14 个难度层各有一场终焉神殿，打完才切到下一难度起点。这是进度状态机的换挡点，"
+        "不是普通关卡。资源副本把金币和遗物材料从主线里拆出去，形成短周期目标。\n"
+    ),
+    (
+        "【挂机与离线 {i:06d}】{domain}\n"
+        "salt={salt}\n"
+        "在线挂机和离线收益共用逐关基准，锚在主线进度。离线按 lastOnlineTime 只生成一次待领；"
+        "领成功后再移动时间锚点。断线先写下线时间并结算未入账的在线挂机，避免重连重复计算。\n"
+    ),
+    (
+        "【奖励申报 {i:06d}】{domain}\n"
+        "salt={salt}\n"
+        "客户端最多上报 30 条击杀，关卡必须等于服务端当前关。金币经验超上限截断。"
+        "装备和卷轴由服务端抽取，不接受客户端自带掉落。超速批次整批丢弃，回包仍成功、入账为零。\n"
+    ),
 )
 
 
@@ -79,10 +167,7 @@ def unique_salt() -> str:
 
 
 def bust_prefix(body: str, lines: int = UNIQUE_PREFIX_LINES) -> str:
-    """在文本最前面插入每轮都不同的盐，从 token 0 打断 prefix cache。
-
-    只靠不带 session_id 不够：多数上游仍按 prompt 前缀缓存。
-    """
+    """在文本最前面插入每轮都不同的盐，从 token 0 打断 prefix cache。"""
     salt = unique_salt()
     count = max(int(lines), 1)
     header = "\n".join(
@@ -92,20 +177,95 @@ def bust_prefix(body: str, lines: int = UNIQUE_PREFIX_LINES) -> str:
     return f"{header}\n{body}\nEND_CACHE_BYPASS {salt}"
 
 
-def pad_to_tokens(text: str, target: int, *, salt: str = "stable") -> str:
+def game_bible() -> str:
+    path = Path(__file__).parent / "data" / "destiny_journey_context.md"
+    if path.is_file():
+        return path.read_text(encoding="utf-8").strip() + "\n"
+    return ""
+
+
+def worker_domain(worker_id: int) -> str:
+    return WORKER_DOMAINS[int(worker_id) % len(WORKER_DOMAINS)]
+
+
+def worker_start(worker_id: int) -> tuple[str, str]:
+    return WORKER_STARTS[int(worker_id) % len(WORKER_STARTS)]
+
+
+def _window_overhead(context_window: int) -> int:
+    window = max(int(context_window), 1)
+    return min(TOKEN_OVERHEAD, max(window // 20, 1))
+
+
+def clamp_output_tokens(input_tokens: int, max_tokens: int, context_window: int) -> int:
+    """输出顶满剩余窗口，但不超过 --max_tokens。"""
+    room = max(int(context_window) - int(input_tokens) - _window_overhead(context_window), 1)
+    return max(1, min(int(max_tokens), room))
+
+
+def fit_max_input(max_input: int, max_tokens: int, context_window: int) -> int:
+    """给输出留位置；输入上限不超过窗口。"""
+    window = max(int(context_window), 1)
+    min_out = max(min(int(max_tokens), DEFAULT_OUTPUT_RESERVE, max(window // 5, 1)), 1)
+    cap = max(window - _window_overhead(window) - min_out, 1)
+    return max(1, min(int(max_input), cap))
+
+
+def plan_request(
+    *,
+    max_input: int,
+    max_tokens: int,
+    context_window: int,
+) -> dict[str, int]:
+    inp = fit_max_input(max_input, max_tokens, context_window)
+    out = clamp_output_tokens(inp, max_tokens, context_window)
+    return {"input_tokens": inp, "max_tokens": out}
+
+
+def slice_to_tokens(text: str, target: int) -> str:
+    """按字符比例切前缀，保证 step k 是 step k+1 的字节前缀。"""
+    if not text:
+        return ""
+    target = max(int(target), 1)
+    total = estimate_tokens(text)
+    if total <= target:
+        return text
+    n = max(1, int(len(text) * target / total))
+    return text[:n]
+
+
+def pad_to_tokens(text: str, target: int, *, salt: str = "stable", domain: str = "") -> str:
     """把文本填充到目标 token。同一 salt 得到同一前缀，便于缓存命中。"""
     target = max(int(target), 0)
     body = text or ""
     if estimate_tokens(body) >= target:
         return body
+    topic = domain or "卡琳@雷鸣区"
+    bible = game_bible()
+    if bible and "宿命旅途" not in body:
+        body = bible + body
     parts = [body.rstrip(), "\n===== CONTEXT PADDING =====\n"]
     current = estimate_tokens("".join(parts))
-    sample = _PAD_BLOCK.format(i=0, salt=salt)
-    block_tokens = max(estimate_tokens(sample), 1)
+
+    def render(index: int) -> str:
+        template = _PAD_BLOCKS[index % len(_PAD_BLOCKS)]
+        return template.format(
+            i=index,
+            salt=salt,
+            domain=topic,
+            layer=(index % 15) + 1,
+            chapter=(index % 23) + 1,
+            stage=(index % 5) + 1,
+        )
+
+    block_tokens = [
+        max(estimate_tokens(render(slot)), 1) for slot in range(len(_PAD_BLOCKS))
+    ]
     index = 0
     while current < target:
-        parts.append(_PAD_BLOCK.format(i=index, salt=salt))
-        current += block_tokens
+        slot = index % len(_PAD_BLOCKS)
+        parts.append(render(index))
+        current += block_tokens[slot]
         index += 1
         if index > 1_000_000:
             break
@@ -121,13 +281,7 @@ def compose_system(
     input_tokens: int = TARGET_INPUT_TOKENS,
     salt: str = "stable",
 ) -> str:
-    """拼出本轮 system。
-
-    - text / file：自定义系统提示，file 在前、text 在后
-    - context_file：额外长上下文，叠在最前面
-    - kind=long：再填充到 input_tokens，用来测 Prompt Cache
-    - kind=short：不填充
-    """
+    """拼出系统提示。kind=long 时填到 input_tokens。"""
     body = (text or "").strip()
     from_file = read_text_file(file, label="system_file").strip()
     if from_file:
@@ -150,9 +304,43 @@ def compose_user(prompt: str = "", prompt_file: str = "") -> str:
     return body or DEFAULT_USER
 
 
-def build_user_prompt(template: str, *, worker_id: int, uid: str) -> str:
-    body = (template or DEFAULT_USER).strip() or DEFAULT_USER
-    return f"{body}\n[conversation w{worker_id:03d} {uid}]"
+def build_hit_user(template: str = "", extra: str = "") -> str:
+    """命中缓存用的同一条命令：每一波字节都一样。"""
+    body = (template or "").strip() or DEFAULT_USER
+    extra = (extra or "").strip()
+    if extra:
+        return f"{body}\n{extra}"
+    return body
+
+
+def build_miss_user(
+    template: str = "",
+    *,
+    worker_id: int = 0,
+    seq: int = 1,
+    extra: str = "",
+) -> str:
+    """不走缓存：每次换一场、换坐标、换盐，命令本身就不同。"""
+    hero, zone, layer, chapter, stage, scene = MISS_SCENES[
+        (int(worker_id) + int(seq)) % len(MISS_SCENES)
+    ]
+    salt = unique_salt()
+    parts = [
+        f"本场命令编号 {salt}",
+        f"区服 {zone}，初始伙伴 {hero}。",
+        f"主线坐标：难度层 {layer}、第 {chapter} 章、第 {stage} 关。",
+        f"这一场要演：{scene}。",
+        "按《宿命旅途》档案写完，不要问是否继续，写到输出上限。",
+        "字段用 currentStageId、clearedStages、battleMode、roster、team、lastOnlineTime。",
+        f"不要复用上一场的对白、掉落和结算。seq={seq} worker={worker_id:03d}",
+    ]
+    custom = (template or "").strip()
+    if custom and custom != DEFAULT_USER:
+        parts.append(custom)
+    extra = (extra or "").strip()
+    if extra:
+        parts.append(extra)
+    return "\n".join(parts)
 
 
 def build_followup_prompt(turn: int, template: str = "") -> str:

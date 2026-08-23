@@ -99,7 +99,7 @@ class StreamMeasurement:
     def live_snapshot(self) -> dict:
         now = time.perf_counter()
         text = "".join(self.streamed_parts) or "".join(self.text_parts)
-        out_tokens = _estimate_tokens(text)
+        out_tokens = max(len(text) // 4, 1) if text else 0
         decode_s = 0.0
         if self.first_at is not None:
             decode_s = max(now - self.first_at, 0.0)
@@ -112,6 +112,7 @@ class StreamMeasurement:
             "chars": len(text),
             "out_tokens": out_tokens,
             "tok_s": (out_tokens / decode_s) if decode_s > 0.05 and out_tokens else 0.0,
+            "text": text,
         }
 
     def _emit_progress(self, *, force: bool = False) -> None:

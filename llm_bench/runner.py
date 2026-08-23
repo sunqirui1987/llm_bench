@@ -21,7 +21,14 @@ from .config import (
     resolve_base_urls,
 )
 from .engine import run_pool, turn_request as _turn_request
-from .prompts import compose_system, compose_user, estimate_tokens
+from .prompts import (
+    CONTEXT_WINDOW,
+    compose_system,
+    compose_user,
+    estimate_tokens,
+    fit_max_input,
+    plan_request,
+)
 from .protocols.registry import PROTOCOLS
 from .reporting import (
     aggregate_cache_percent,
@@ -113,46 +120,57 @@ def _print_start(
     system_text: str,
     prompt: str,
     max_tokens: int,
-) -> None:
+    max_input: int,
+    context_window: int,
+    plan: list[dict],
+) -> list[str]:
     total = workers * max(int(rounds), 0)
     if hit_cache:
         title = "LLM Bench · 要缓存"
         session_desc = f"每路钉死一条 session（示例 {initial_session}）"
-        cache_flow = "粘 session + 固定前缀；第 1 轮冷启，第 2 轮起应对上 cache"
+        cache_flow = "同一条命令原样再发。第 1 次冷启，第 2 次起应对上 cache"
     else:
         title = "LLM Bench · 不要缓存"
-        session_desc = "不带 session；每轮打散前缀"
-        cache_flow = "不带 session，并在 prompt 最前面换新盐"
-    print(f"\n{'═' * 88}")
-    print(
-        f"{title}  workers={workers}（并发对话）  "
-        f"rounds={rounds}（每路问答轮数）  合计最多 {total} 次  "
-        f"duration={duration or 'off'}s  cache_mode={cache_mode}"
-    )
+        session_desc = "不带 session"
+        cache_flow = "每一次都是一条新命令：换盐、换场景、换坐标"
+    lines = [
+        "═" * 88,
+        (
+            f"{title}  workers={workers}（一波全量线程）  "
+            f"rounds={rounds}（同一批命令再发几遍）  合计最多 {total} 次  "
+            f"duration={duration or 'off'}s  cache_mode={cache_mode}"
+        ),
+    ]
     if fd_limit:
-        print(f"   fd limit : {fd_limit}")
-    print(f"   chat      : {base_urls['chat']}")
-    print(f"   responses : {base_urls['responses']}")
-    print(f"   messages  : {base_urls['messages']}")
-    print(f"   models    : {', '.join(models)}")
-    print(f"   formats   : {', '.join(formats)}")
-    print(f"   session   : {session_desc}")
-    print(f"   cache     : {cache_flow}")
-    print(f"   retries   : {retries}  timeout={timeout}s  delay={retry_delay}s")
-    prefix_tokens = estimate_tokens(system_text)
-    print(
-        f"   system    : {system}  {len(system_text)} 字 / {prefix_tokens} token  "
-        f"首轮约 {prefix_tokens + estimate_tokens(prompt)} token"
+        lines.append(f"   fd limit : {fd_limit}")
+    lines.extend(
+        [
+            f"   chat      : {base_urls['chat']}",
+            f"   responses : {base_urls['responses']}",
+            f"   messages  : {base_urls['messages']}",
+            f"   models    : {', '.join(models)}",
+            f"   formats   : {', '.join(formats)}",
+            f"   session   : {session_desc}",
+            f"   cache     : {cache_flow}",
+            f"   retries   : {retries}  timeout={timeout}s  delay={retry_delay}s",
+            (
+                f"   window    : context={context_window}  "
+                f"input≈{plan['input_tokens']}  output_cap={plan['max_tokens']}"
+            ),
+        ]
     )
-    print(f"   prompt    : {prompt[:50]}{'...' if len(prompt) > 50 else ''}")
-    print(f"   max_tokens: {max_tokens}")
-    print("   画面      : 像 top 清屏。work=一路对话，--round=这一路当前第几次问答")
-    if hit_cache and prefix_tokens < 2048:
-        print(
-            f"⚠️ cache_mode=hit 但 system 只有 {prefix_tokens} token，"
-            "多数服务要 1024+ 才缓存。请用 --system long。"
+    prefix_tokens = estimate_tokens(system_text)
+    lines.append(
+        f"   system    : {system}  指令 {len(system_text)} 字 / {prefix_tokens} token"
+    )
+    lines.append(f"   prompt    : {prompt[:50]}{'...' if len(prompt) > 50 else ''}")
+    if hit_cache and max_input < 2048:
+        lines.append(
+            f"⚠️ cache_mode=hit 但 system 只有 {max_input} token，"
+            "多数服务要 1024+ 才缓存。请加大 --input_tokens。"
         )
-    print(f"{'═' * 88}")
+    lines.append("═" * 88)
+    return lines
 
 
 def bench(
@@ -167,27 +185,29 @@ def bench(
     prompt: str = DEFAULT_PROMPT,
     prompt_file: str = "",
     followup: str = "",
-    rounds: int = 5000,
+    rounds: int = 2,
     throttle: float = 0.0,
     system: str = "long",
     system_prompt: str = "",
     system_file: str = "",
     input_tokens: int = TARGET_INPUT_TOKENS,
+    context_window: int = CONTEXT_WINDOW,
     context_file: str = "",
     session_id: str = "",
     retries: int = 2,
     retry_delay: float = 1.0,
-    timeout: int = 1800,
+    timeout: int = 7200,
     workers: int = DEFAULT_WORKERS,
     duration: float = 0.0,
     report_every: float = 5.0,
     verbose: bool = False,
     cache_mode: str = "hit",
 ):
-    """workers 路并发对话；每路 rounds 轮「用户输入 → 模型输出」。
+    """workers 路同时发命令。
 
-      --cache_mode hit   本路 session 一直带着，前缀固定。
-      --cache_mode miss  不带 session，每轮打散前缀。
+    --cache_mode hit   同一条命令原样再发，粘 session。第 1 次冷，第 2 次起命中。
+    --cache_mode miss  每一次都换新命令，不带 session。
+    --rounds           全量线程把这条命令再发几遍。
     """
     del report_every, verbose
     models, formats, base_urls, api_key, initial_session = _prepare(
@@ -202,21 +222,30 @@ def bench(
     )
     cache_mode = parse_cache_mode(cache_mode)
     hit_cache = cache_mode == "hit"
+    context_window = max(int(context_window), 1)
+    max_tokens = max(int(max_tokens), 1)
+    max_input = fit_max_input(input_tokens, max_tokens, context_window)
+    plan = plan_request(
+        max_input=max_input,
+        max_tokens=max_tokens,
+        context_window=context_window,
+    )
+    pad = (system or "long").strip().lower() != "short"
     system_text, prompt, followup_text = _build_prompts(
-        system=system,
+        system="short",
         system_prompt=system_prompt,
         system_file=system_file,
         prompt=prompt,
         prompt_file=prompt_file,
         followup=followup,
         context_file=context_file,
-        input_tokens=input_tokens,
+        input_tokens=max_input,
     )
     workers = max(int(workers), 1)
     duration = max(float(duration), 0.0)
     fd_limit = raise_fd_limit(workers * 8 + 256)
     configure_pool(workers)
-    _print_start(
+    header = _print_start(
         hit_cache=hit_cache,
         workers=workers,
         rounds=rounds,
@@ -234,6 +263,9 @@ def bench(
         system_text=system_text,
         prompt=prompt,
         max_tokens=max_tokens,
+        max_input=max_input,
+        context_window=context_window,
+        plan=plan,
     )
 
     summary: dict = {}
@@ -243,10 +275,13 @@ def bench(
         protocol = PROTOCOLS[format_name]
         protocol_base = base_urls[format_name]
         for model in models:
-            print(f"\n▶ {format_name}  {protocol_base}{protocol.endpoint}  model={model}")
+            live_header = [
+                *header,
+                f"▶ {format_name}  {protocol_base}{protocol.endpoint}  model={model}",
+            ]
             rows, stats, gate = run_pool(
                 workers=workers,
-                turns=int(rounds),
+                rounds=int(rounds),
                 duration=duration,
                 system=system_text,
                 user=prompt,
@@ -262,6 +297,10 @@ def bench(
                 retries=retries,
                 retry_delay=retry_delay,
                 throttle=throttle,
+                max_input=max_input if pad else 0,
+                context_window=context_window,
+                pad=pad,
+                header=live_header,
             )
             snap = stats.snapshot()
             snapshots[(format_name, model)] = snap
@@ -273,7 +312,9 @@ def bench(
             if not rows:
                 print("⚠️ 没有成功样本")
                 continue
-            print(f"   有效问答: {len(rows)}（{workers} 路 × 每路最多 {rounds} 轮）")
+            print(
+                f"   有效请求: {len(rows)}（{int(rounds)} 波 × {workers} 路）"
+            )
             summary[(format_name, model)] = rows
             print_model_average(rows, show_cache=hit_cache)
             print_token_totals(rows, show_cache=hit_cache)
@@ -287,6 +328,7 @@ def bench(
             "models": models,
             "cache_mode": cache_mode,
             "workers": workers,
+            "rounds": rounds,
             "system": system,
             "base_url": base_urls.get(formats[0], "") if formats else "",
         },
@@ -310,18 +352,19 @@ def cache(
     prompt: str = DEFAULT_PROMPT,
     prompt_file: str = "",
     followup: str = "",
-    rounds: int = 5,
+    rounds: int = 2,
     throttle: float = 0.3,
     system: str = "long",
     system_prompt: str = "",
     system_file: str = "",
     input_tokens: int = TARGET_INPUT_TOKENS,
+    context_window: int = CONTEXT_WINDOW,
     context_file: str = "",
     session_id: str = "",
     retries: int = 2,
     retry_delay: float = 1.0,
 ):
-    """单路缓存诊断：同一对话连问 rounds 轮，看 R1 冷启 → R2 命中。"""
+    """单路缓存诊断：同一条命令连发 rounds 次，看第 1 次冷启 → 第 2 次起命中。"""
     models, formats, base_urls, api_key, active_session = _prepare(
         models,
         formats,
@@ -332,19 +375,24 @@ def cache(
         api_key,
         session_id,
     )
+    context_window = max(int(context_window), 1)
+    max_tokens = max(int(max_tokens), 1)
+    max_input = fit_max_input(input_tokens, max_tokens, context_window)
     system_text, prompt, followup_text = _build_prompts(
-        system=system,
+        system="short",
         system_prompt=system_prompt,
         system_file=system_file,
         prompt=prompt,
         prompt_file=prompt_file,
         followup=followup,
         context_file=context_file,
-        input_tokens=input_tokens,
+        input_tokens=max_input,
     )
     configure_pool(1)
     print(f"\n{'═' * 88}")
-    print(f"LLM Bench · 缓存冷启诊断  1 路对话 × {rounds} 轮问答")
+    print(
+        f"LLM Bench · 缓存冷启诊断  1 路把同一条命令连发 {rounds} 次"
+    )
     print(f"   responses : {base_urls['responses']}")
     print(f"   session   : {active_session}")
     print(f"{'═' * 88}")
@@ -358,7 +406,7 @@ def cache(
             print(f"\n▶ {format_name}  {model}  session={model_session}")
             rows, stats, gate = run_pool(
                 workers=1,
-                turns=int(rounds),
+                rounds=int(rounds),
                 duration=0,
                 system=system_text,
                 user=prompt,
@@ -370,19 +418,23 @@ def cache(
                 api_key=api_key,
                 model=model,
                 max_tokens=max_tokens,
-                timeout=180,
+                timeout=7200,
                 retries=retries,
                 retry_delay=retry_delay,
                 throttle=throttle,
+                max_input=max_input,
+                context_window=context_window,
+                pad=True,
             )
             print_stress_summary(stats.snapshot(), limit=gate.limit, show_cache=True)
             if not rows:
                 print("❌ 全部失败")
                 continue
-            steady = rows[1:]
+            first = [row for row in rows if int(row.get("wave") or 0) == 1]
+            later = [row for row in rows if int(row.get("wave") or 0) > 1]
             print(
-                f"📊 第1轮(冷启)={cache_percent(rows[0])}  "
-                f"第2轮起={aggregate_cache_percent(steady) if steady else 'n/a'}  "
+                f"📊 第1次(冷启)={aggregate_cache_percent(first) if first else cache_percent(rows[0])}  "
+                f"第2次起={aggregate_cache_percent(later) if later else 'n/a'}  "
                 f"整体={aggregate_cache_percent(rows)}"
             )
     print()

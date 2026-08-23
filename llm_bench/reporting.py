@@ -72,6 +72,45 @@ def worker_label(worker: int) -> str:
     return f"work{max(int(worker), 1)}"
 
 
+OUTPUT_TAIL_LINES = 4
+OUTPUT_TAIL_WIDTH = 86
+
+
+class OutputLog:
+    """不往控制台打字。结束时把全文写入 logs/，面板自己刷。"""
+
+    def __init__(self, log_dir=None):
+        self.log_dir = log_dir
+
+    def start_step(self, *args, **kwargs) -> None:
+        return
+
+    def append_text(self, *args, **kwargs) -> None:
+        return
+
+    def finish_step(
+        self,
+        worker: int,
+        wave: int,
+        result: dict,
+    ) -> None:
+        if self.log_dir is None:
+            return
+        from pathlib import Path
+
+        folder = Path(self.log_dir)
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"w{worker:02d}-round{wave}.txt"
+        path.write_text(str(result.get("text") or ""), encoding="utf-8")
+
+    def fail_step(self, *args, **kwargs) -> None:
+        return
+
+
+def _step_label(worker: int, wave: int, step: int, steps: int) -> str:
+    return f"{worker_label(worker)} wave{wave} step{step}/{steps}"
+
+
 def _round_cache_label(state: dict, turn: int | None = None) -> str:
     inp = int(state.get("input_tokens") or 0)
     cached = int(state.get("cached_tokens") or 0)
@@ -94,11 +133,11 @@ def _round_cache_label(state: dict, turn: int | None = None) -> str:
 def print_bench_header(*, show_cache: bool = True) -> None:
     extra = f"{'cache%':>8}" if show_cache else ""
     print(
-        "完成的问答从这里往上滚（每一路自己的第 1、2、3… 轮；workers 是并发对话）：",
+        "完成的对话从这里往上滚（每路固定 5 步，输入 1/5 → 满；rounds 是再拉起一波全量线程）：",
         flush=True,
     )
     print(
-        f"{'对话':<8}{'问答':<8}{'TTFT':>10}{'tok/s':>9}{'E2E':>10}"
+        f"{'对话':<8}{'波/步':<10}{'TTFT':>10}{'tok/s':>9}{'E2E':>10}"
         f"{'用户输入':>10}{'模型输出':>10}{extra}",
         flush=True,
     )
@@ -111,9 +150,9 @@ def format_bench_row(index: int, result: dict, *, show_cache: bool = True) -> st
     )
     extra = f"{cache_percent(result):>8}" if show_cache else ""
     worker = worker_label(result.get("worker") or 1)
-    turn = int(result.get("turn") or index)
+    wave = int(result.get("wave") or result.get("turn") or index)
     return (
-        f"{worker:<8}第{turn:<3}轮"
+        f"{worker:<8}r{wave:<3}"
         f"{format_ms(result['ttft_ms'])}"
         f"{format_tps(result.get('output_tps'))}"
         f"{format_ms(result['e2e_ms'])}"
@@ -128,16 +167,21 @@ def print_bench_row(index: int, result: dict, *, show_cache: bool = True) -> Non
 
 
 class WorkerBoard:
-    """多路并发对话：每个 work 一路聊天，round 是这一路的第几次问答。"""
+    """多路并发：每一波每人发一条命令。"""
 
-    def __init__(self, workers: int, rounds: int = 1):
+    def __init__(self, workers: int, rounds: int | None = None, steps: int = 1, waves: int = 1):
         self.workers = max(int(workers), 1)
-        self.rounds = max(int(rounds), 1)
+        total = int(rounds if rounds is not None else waves)
+        self.waves = max(total, 1)
+        self.steps = self.waves
+        self.rounds = self.waves
+        self.wave = 1
         self._lock = threading.Lock()
         self._states = {
             i: {
                 "phase": "idle",
                 "turn": 0,
+                "wave": 1,
                 "done": 0,
                 "ttft_ms": None,
                 "chunks": 0,
@@ -148,31 +192,47 @@ class WorkerBoard:
                 "input_tokens": 0,
                 "cached_tokens": 0,
                 "cache_percent": None,
+                "text": "",
             }
             for i in range(1, self.workers + 1)
         }
 
-    def begin_round(self, worker: int, turn: int) -> None:
+    def set_wave(self, wave: int) -> None:
+        self.wave = max(int(wave), 1)
+        with self._lock:
+            for state in self._states.values():
+                state.update(phase="idle", turn=0, wave=self.wave, done=0, error="")
+
+    def begin_round(self, worker: int, turn: int, wave: int | None = None) -> None:
         self.update(
             worker,
             phase="wait",
             turn=int(turn),
+            wave=int(wave or self.wave),
             out_tokens=0,
             tok_s=0.0,
             error="",
+            text="",
             started=time.perf_counter(),
         )
 
-    def fail_round(self, worker: int, turn: int, error: str) -> None:
-        self.update(worker, phase="error", turn=int(turn), error=str(error)[:80])
+    def fail_round(self, worker: int, turn: int, error: str, wave: int | None = None) -> None:
+        self.update(
+            worker,
+            phase="error",
+            turn=int(turn),
+            wave=int(wave or self.wave),
+            error=str(error)[:80],
+        )
 
-    def finish_round(self, worker: int, turn: int, result: dict) -> None:
+    def finish_round(self, worker: int, turn: int, result: dict, wave: int | None = None) -> None:
         inp = int(result.get("input_tokens") or 0)
         cached = int(result.get("cached_tokens") or 0)
         self.update(
             worker,
             phase="idle",
             turn=int(turn),
+            wave=int(wave or self.wave),
             done=int(turn),
             out_tokens=int(result.get("output_tokens") or 0),
             tok_s=float(result.get("output_tps") or 0),
@@ -180,6 +240,7 @@ class WorkerBoard:
             cached_tokens=cached,
             cache_percent=(100.0 * cached / inp) if inp > 0 else None,
             cache_turn=int(turn),
+            text=str(result.get("text") or ""),
             started=None,
         )
 
@@ -190,6 +251,7 @@ class WorkerBoard:
                 self._states[worker] = {
                     "phase": "idle",
                     "turn": 0,
+                    "wave": self.wave,
                     "done": 0,
                     "ttft_ms": None,
                     "chunks": 0,
@@ -200,6 +262,7 @@ class WorkerBoard:
                     "input_tokens": 0,
                     "cached_tokens": 0,
                     "cache_percent": None,
+                    "text": "",
                 }
             self._states[worker].update(fields)
 
@@ -214,6 +277,7 @@ class WorkerBoard:
                 chars=snap.get("chars") or 0,
                 out_tokens=snap.get("out_tokens") or 0,
                 tok_s=snap.get("tok_s") or 0.0,
+                text=snap.get("text") or "",
             )
         return _cb
 
@@ -285,6 +349,47 @@ class WorkerBoard:
             "tok_s": (sum(tok_s_vals) / len(tok_s_vals)) if tok_s_vals else 0.0,
         }
 
+    def worker_state(self, worker: int) -> dict | None:
+        worker = max(int(worker), 1)
+        with self._lock:
+            state = self._states.get(worker)
+            return dict(state) if state is not None else None
+
+    def status_lines(self) -> list[str]:
+        now = time.perf_counter()
+        with self._lock:
+            items = sorted(self._states.items())
+        lines = []
+        for worker, state in items:
+            phase = state.get("phase") or "idle"
+            round_no = max(int(state.get("turn") or state.get("wave") or 0), 1)
+            out = int(state.get("out_tokens") or 0)
+            tok_s = float(state.get("tok_s") or 0.0)
+            ttft = state.get("ttft_ms")
+            started = state.get("started")
+            elapsed = (now - started) if started else 0.0
+            name = f"{worker_label(worker):<6}"
+            if phase == "stream":
+                first = f"  ttft={ttft / 1000:.1f}s" if ttft is not None else ""
+                lines.append(
+                    f"{name} 输出中  第{round_no}/{self.waves}次  "
+                    f"out={out}  {tok_s:.0f} tok/s{first}  {elapsed:.0f}s"
+                )
+            elif phase == "wait":
+                lines.append(
+                    f"{name} 等首字  第{round_no}/{self.waves}次  已等 {elapsed:.0f}s"
+                )
+            elif phase == "error":
+                err = (state.get("error") or "").strip()
+                lines.append(f"{name} 失败    第{round_no}/{self.waves}次  {err[:50]}")
+            elif int(state.get("done") or 0):
+                lines.append(
+                    f"{name} 完成    第{int(state.get('done'))}/{self.waves}次  out={out}"
+                )
+            else:
+                lines.append(f"{name} 空闲")
+        return lines
+
     def compact_cells(self) -> list[str]:
         return self.worker_lines()
 
@@ -293,10 +398,11 @@ class WorkerBoard:
         with self._lock:
             items = sorted(self._states.items())
         lines = []
-        total = self.rounds
+        waves = self.waves
         for worker, state in items:
             phase = state.get("phase") or "idle"
             turn = max(int(state.get("turn") or 0), 1)
+            wave = max(int(state.get("wave") or self.wave or 1), 1)
             done = int(state.get("done") or 0)
             out_tokens = int(state.get("out_tokens") or 0)
             tok_s = float(state.get("tok_s") or 0.0)
@@ -308,45 +414,48 @@ class WorkerBoard:
             cache_bit = _round_cache_label(state, turn)
             inp = int(state.get("input_tokens") or 0)
             lines.append(f"{name}")
-            prefix = f"  └─ --round{turn}/{total}"
+            prefix = f"  └─ 第 {wave}/{waves} 次"
             if phase == "stream":
                 first = f" · 首字 {ttft / 1000:.1f}s" if ttft is not None else ""
                 lines.append(
-                    f"{prefix}  [模型正在输出]  "
-                    f"已吐 {out_tokens} token · {tok_s:.1f} tok/s · 本轮已 {elapsed:.0f}s"
+                    f"{prefix}  [输出中]  "
+                    f"{out_tokens} tok · {tok_s:.1f}/s · {elapsed:.0f}s"
                     f"{first}  ·  {cache_bit}"
                 )
             elif phase == "wait":
                 lines.append(
-                    f"{prefix}  [等待模型首字]  "
-                    f"用户输入已发出 · 已等 {elapsed:.0f}s  ·  {cache_bit}"
+                    f"{prefix}  [等首字]  已等 {elapsed:.0f}s  ·  {cache_bit}"
                 )
             elif phase == "error":
-                lines.append(
-                    f"{prefix}  [请求失败]  {err[:70]}  ·  {cache_bit}"
-                )
-            elif done >= total:
-                io_bit = f"输入 {inp} → 输出 {out_tokens}  ·  " if inp or out_tokens else ""
-                lines.append(
-                    f"  └─ --round{done}/{total}  [全部轮次结束]  {io_bit}{cache_bit}"
-                )
+                lines.append(f"{prefix}  [失败]  {err[:70]}")
             elif done:
                 io_bit = f"输入 {inp} → 输出 {out_tokens}  ·  " if inp or out_tokens else ""
-                lines.append(
-                    f"  └─ --round{done}/{total}  [本轮问答结束]  {io_bit}{cache_bit}"
-                )
+                lines.append(f"{prefix}  [结束]  {io_bit}{cache_bit}")
             else:
-                lines.append(f"  └─ --round1/{total}  [尚未开始]  还没发出用户输入")
+                lines.append(f"{prefix}  [待命]")
+            for row in _output_tail(str(state.get("text") or "")):
+                lines.append(f"     {row}")
         return lines
 
 
-class LiveFooter:
-    """像 top 一样清屏刷新：work 为并发对话，下面只显示当前这一轮问答。"""
+def _output_tail(text: str, n: int = OUTPUT_TAIL_LINES) -> list[str]:
+    rows = [row[:OUTPUT_TAIL_WIDTH] for row in (text or "").replace("\r", "").split("\n") if row]
+    tail = rows[-n:] if rows else []
+    if not tail:
+        tail = ["(还没出字)"]
+    while len(tail) < n:
+        tail.append("")
+    return tail[:n]
 
-    def __init__(self, *, stats, board: WorkerBoard, gate=None):
+
+class LiveFooter:
+    """整屏清空后重画：顶部保留启动横幅，下面每个 work 只出现一次。"""
+
+    def __init__(self, *, stats, board: WorkerBoard, gate=None, header: list[str] | None = None):
         self.stats = stats
         self.board = board
         self.gate = gate
+        self.header = list(header or [])
         self._lock = threading.Lock()
         self._n = 0
         self._stop = threading.Event()
@@ -354,22 +463,23 @@ class LiveFooter:
         self._tty = hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
 
     def start(self) -> None:
+        if self._tty:
+            sys.stdout.write("\033[?25l")
+            sys.stdout.flush()
+        self.refresh()
         self._thread = threading.Thread(
             target=self._run, name="llm-bench-live", daemon=True
         )
         self._thread.start()
 
     def _run(self) -> None:
-        while not self._stop.wait(0.5):
+        while not self._stop.wait(0.4):
             self.refresh()
 
     def log(self, text: str) -> None:
-        """清屏模式下不往下滚；错误写进对应 worker 的当前 round。"""
-        self.refresh()
+        return
 
     def refresh(self) -> None:
-        if not self._tty:
-            return
         with self._lock:
             self._draw()
 
@@ -380,18 +490,16 @@ class LiveFooter:
             self._thread = None
         with self._lock:
             if self._tty:
-                sys.stdout.write("\033[H\033[J")
+                sys.stdout.write("\033[?25h\n")
                 sys.stdout.flush()
 
     def _draw(self) -> None:
-        if self._tty:
-            sys.stdout.write("\033[H\033[J")
-        lines = self._compose()
-        if not lines:
+        if not self._tty:
             return
-        sys.stdout.write("\n".join(lines) + "\n")
+        sys.stdout.write("\033[H\033[J")
+        sys.stdout.write("\n".join(self._compose()) + "\n")
         sys.stdout.flush()
-        self._n = len(lines)
+        self._n = 0
 
     def _compose(self) -> list[str]:
         snap = self.stats.snapshot()
@@ -402,22 +510,18 @@ class LiveFooter:
             first = "都还没出第一个字"
         else:
             first = f"平均 {ttft / 1000:.1f} 秒才出第一个字"
-        title = (
-            f"LLM Bench  │  {self.board.workers} 路并发对话 × 每路 {self.board.rounds} 轮问答"
-            f"  │  已跑 {snap.elapsed:.0f}s  │  正在聊 {snap.in_flight}/{limit}"
-            f"  │  已完成问答 {snap.ok}"
+        live_line = (
+            f"⏱ {snap.elapsed:.0f}s  inflight={snap.in_flight}/{limit}  "
+            f"ok={snap.ok} fail={snap.fail} 429={snap.rate_limited}  "
+            f"wait={live['waiting']} stream={live['streaming']}  "
+            f"out={live['out_tokens']}  {live['tok_s']:.1f} tok/s  {first}"
         )
-        stats = (
-            f"等模型 {live['waiting']} 路  ·  模型正在说 {live['streaming']} 路  ·  "
-            f"{first}  ·  正在输出合计 {live['out_tokens']} token  ·  "
-            f"{live['tok_s']:.1f} tok/s"
-        )
-        hint = (
-            "work = 并发对话。--round = 这一路当前第几次问答（用户输入 → 等模型 → 模型输出）。"
-            "每路只显示最新一轮在做什么。"
-        )
-        rule = "─" * 88
-        return [title, stats, hint, rule, *self.board.worker_lines()]
+        lines = []
+        if self.header:
+            lines.extend(self.header)
+            lines.append("")
+        lines.extend([live_line, "─" * 88, *self.board.worker_lines()])
+        return lines
 
 
 class RoundLiveDisplay:
@@ -619,6 +723,7 @@ def write_report(
         f"- 模型: {', '.join(meta.get('models') or [])}",
         f"- cache_mode: {meta.get('cache_mode', '')}",
         f"- workers: {meta.get('workers', '')}",
+        f"- rounds: {meta.get('rounds', '')}",
         f"- system: {meta.get('system', '')}",
         f"- 接入: {meta.get('base_url', '')}",
         "",
@@ -666,18 +771,26 @@ def write_report(
         for worker in sorted(by_worker):
             lines.append(f"### {worker_label(worker)}（第 {worker} 路并发对话）")
             lines.append("")
-            for row in sorted(by_worker[worker], key=lambda item: int(item.get("turn") or 0)):
-                turn = int(row.get("turn") or 0)
-                lines.append(f"#### 第 {turn} 轮问答（用户输入 → 模型输出）")
+            for row in sorted(
+                by_worker[worker],
+                key=lambda item: int(item.get("wave") or item.get("turn") or 0),
+            ):
+                wave = int(row.get("wave") or row.get("turn") or 0)
+                lines.append(f"#### 第 {wave} 次命令")
                 lines.append(
                     f"- TTFT {_md(row.get('ttft_ms'))} ms · "
                     f"tok/s {_md(row.get('output_tps'))} · "
                     f"输入 {row.get('input_tokens', 0)} → 输出 {row.get('output_tokens', 0)} · "
                     f"cache {cache_percent(row).strip()}"
                 )
-                snippet = (row.get("snippet") or "").strip()
-                if snippet:
-                    lines.append(f"- 回复摘要: {snippet}")
+                text = (row.get("text") or row.get("snippet") or "").strip()
+                if text:
+                    lines.append("")
+                    lines.append("完整输出:")
+                    lines.append("")
+                    lines.append("```")
+                    lines.append(text.replace("```", "'''"))
+                    lines.append("```")
                 lines.append("")
         lines.append("")
     target = Path(path)

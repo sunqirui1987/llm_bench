@@ -197,6 +197,7 @@ class CoreTest(unittest.TestCase):
         self.assertAlmostEqual(result["tpot_ms"], 250.0, places=3)
         live = measurement.live_snapshot()
         self.assertGreater(live["out_tokens"], 0)
+        self.assertIn("text", live)
 
     def test_pad_to_tokens_reaches_target(self):
         padded = pad_to_tokens("hello", 300, salt="bench")

@@ -135,9 +135,52 @@ class StressStatsTest(unittest.TestCase):
         lines = footer._compose()
         joined = "\n".join(lines)
         self.assertIn("work1", joined)
-        self.assertIn("--round", joined)
+        self.assertIn("第", joined)
+        self.assertIn("次", joined)
         self.assertIn("cache=80.0%", joined)
+        self.assertNotIn("快捷键", joined)
         self.assertTrue(any(line.strip() == "work1" for line in lines))
+        self.assertEqual(joined.count("work1"), 1)
+
+    def test_live_footer_clears_screen_and_keeps_header(self):
+        from io import StringIO
+        from unittest.mock import patch
+
+        from llm_bench.reporting import LiveFooter, WorkerBoard
+
+        stats = StressStats(workers=1, window=15, now=Clock())
+        footer = LiveFooter(
+            stats=stats,
+            board=WorkerBoard(1),
+            header=["LLM Bench · 不要缓存  workers=10（一波全量线程）"],
+        )
+        footer._tty = True
+        buf = StringIO()
+        with patch("sys.stdout", buf):
+            footer.refresh()
+        out = buf.getvalue()
+        self.assertTrue(out.startswith("\033[H\033[J"))
+        self.assertIn("LLM Bench · 不要缓存  workers=10（一波全量线程）", out)
+        self.assertEqual(out.count("work1"), 1)
+        self.assertNotIn("快捷键", out)
+
+    def test_output_log_is_silent_and_writes_file(self):
+        import tempfile
+        from io import StringIO
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from llm_bench.reporting import OutputLog
+
+        with tempfile.TemporaryDirectory() as folder:
+            log = OutputLog(log_dir=folder)
+            buf = StringIO()
+            with patch("sys.stdout", buf):
+                log.start_step(1, 1, planned_input=100, planned_output=50)
+                log.finish_step(1, 2, {"text": "Hello world!"})
+            self.assertEqual(buf.getvalue(), "")
+            saved = Path(folder) / "w01-round2.txt"
+            self.assertEqual(saved.read_text(encoding="utf-8"), "Hello world!")
 
 class AdaptiveGateTest(unittest.TestCase):
     def test_rate_limit_halves_pending_limit(self):

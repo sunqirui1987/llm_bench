@@ -1,4 +1,4 @@
-"""通用连续对话：session 亲和、追加、裁剪。"""
+"""同一条命令再发 vs 每次都换新命令。"""
 
 from __future__ import annotations
 
@@ -7,10 +7,12 @@ import unittest
 from llm_bench.conversation import Conversation
 from llm_bench.prompts import (
     DEFAULT_SYSTEM,
+    MISS_SCENES,
     clip_text,
     compose_system,
     compose_user,
     pad_to_tokens,
+    plan_request,
     trim_messages,
 )
 
@@ -22,46 +24,71 @@ class ConversationTest(unittest.TestCase):
         self.assertTrue(first.session_id)
         self.assertTrue(second.session_id)
         self.assertNotEqual(first.session_id, second.session_id)
-        self.assertNotEqual(first.messages[1]["content"], second.messages[1]["content"])
+
+    def test_hit_outbound_is_byte_identical_every_time(self):
+        conv = Conversation(0, system="sys", user="hello", cache=True)
+        first = conv.outbound()
+        second = conv.outbound()
+        self.assertEqual(first, second)
+        self.assertEqual(first[0]["content"], "sys")
+        self.assertEqual(first[1]["content"], "hello")
+        self.assertFalse(first[0]["content"].startswith("CACHE_BYPASS"))
 
     def test_cache_off_has_no_session(self):
         conv = Conversation(0, system="sys", user="hello", cache=False)
         self.assertEqual(conv.session_id, "")
 
-    def test_miss_outbound_busts_prefix_every_call(self):
+    def test_miss_outbound_is_a_new_command_every_time(self):
         conv = Conversation(0, system="sys", user="hello", cache=False)
         first = conv.outbound()
         second = conv.outbound()
         self.assertTrue(first[0]["content"].startswith("CACHE_BYPASS"))
         self.assertTrue(second[0]["content"].startswith("CACHE_BYPASS"))
         self.assertNotEqual(first[0]["content"], second[0]["content"])
-        self.assertEqual(conv.messages[0]["content"], "sys")
+        self.assertNotEqual(first[1]["content"], second[1]["content"])
+        self.assertEqual(len(first), 2)
 
-    def test_hit_outbound_keeps_stable_system_prefix(self):
-        conv = Conversation(0, system="sys", user="hello", cache=True)
-        first = conv.outbound()
-        conv.commit("ok")
-        second = conv.outbound()
-        self.assertEqual(first[0]["content"], "sys")
-        self.assertEqual(second[0]["content"], "sys")
-        self.assertFalse(first[0]["content"].startswith("CACHE_BYPASS"))
+    def test_hit_does_not_put_worker_id_into_the_command(self):
+        a = Conversation(0, system="sys", user="", cache=True).outbound()
+        b = Conversation(1, system="sys", user="", cache=True).outbound()
+        self.assertEqual(a[1]["content"], b[1]["content"])
+        self.assertEqual(a[0]["content"], b[0]["content"])
 
-    def test_commit_appends_assistant_and_next_user(self):
-        conv = Conversation(0, system="sys", user="hello", cache=True)
-        self.assertEqual([item["role"] for item in conv.messages], ["system", "user"])
-        conv.commit("first answer")
-        self.assertEqual(
-            [item["role"] for item in conv.messages],
-            ["system", "user", "assistant", "user"],
+    def test_miss_scenes_cover_different_game_beats(self):
+        self.assertGreaterEqual(len(set(MISS_SCENES)), 5)
+        seen = set()
+        conv = Conversation(0, system="sys", user="", cache=False)
+        for _ in range(8):
+            seen.add(conv.outbound()[1]["content"].splitlines()[2])
+        self.assertGreater(len(seen), 1)
+
+    def test_followup_is_appended_to_the_same_hit_command(self):
+        conv = Conversation(
+            0,
+            system="sys",
+            user="hello",
+            cache=True,
+            followup="请写到首通结算。",
         )
-        self.assertIn("CONTINUE_TURN 1", conv.messages[-1]["content"])
-        self.assertIn("Continue from where you left off", conv.messages[-1]["content"])
-        self.assertEqual(conv.turn, 1)
-        self.assertEqual(conv.messages[2]["content"], "first answer")
-        outbound = conv.outbound()
-        self.assertEqual(len(outbound), 4)
-        outbound[0]["content"] = "mutated"
-        self.assertEqual(conv.messages[0]["content"], "sys")
+        user = conv.outbound()[1]["content"]
+        self.assertIn("请写到首通结算。", user)
+        self.assertEqual(user, conv.outbound()[1]["content"])
+
+    def test_output_budget_fits_the_window(self):
+        conv = Conversation(
+            0,
+            system="sys",
+            user="hello",
+            cache=True,
+            max_input=4000,
+            max_tokens=500000,
+            context_window=8000,
+        )
+        self.assertGreater(conv.output_tokens_for(), 0)
+        self.assertLessEqual(
+            conv.input_tokens_for() + conv.output_tokens_for(),
+            8000,
+        )
 
     def test_trim_keeps_system_and_latest_user(self):
         messages = [{"role": "system", "content": "S"}]
@@ -82,35 +109,36 @@ class ConversationTest(unittest.TestCase):
         self.assertIn("truncated", clipped)
 
     def test_pad_to_tokens_is_stable_for_same_salt(self):
-        first = pad_to_tokens("BASE", 200, salt="same")
-        second = pad_to_tokens("BASE", 200, salt="same")
-        other = pad_to_tokens("BASE", 200, salt="other")
+        first = pad_to_tokens("BASE", 8000, salt="same")
+        second = pad_to_tokens("BASE", 8000, salt="same")
+        other = pad_to_tokens("BASE", 8000, salt="other")
         self.assertEqual(first, second)
         self.assertNotEqual(first, other)
-        self.assertTrue(first.startswith("BASE"))
+        self.assertIn("BASE", first)
         self.assertIn("CONTEXT PADDING", first)
 
-    def test_custom_followup_is_used_on_commit(self):
-        conv = Conversation(
-            0,
-            system="sys",
-            user="hello",
-            cache=False,
-            followup="请继续写下一章，不要重复。",
-        )
-        conv.commit("ok")
-        self.assertIn("请继续写下一章", conv.messages[-1]["content"])
+    def test_pad_blocks_are_destiny_journey_scenes(self):
+        text = pad_to_tokens("BASE", 8000, salt="mix", domain="卡琳@雷鸣区")
+        self.assertIn("主线坐标", text)
+        self.assertIn("终焉神殿", text)
+        self.assertIn("首通结算", text)
+        self.assertIn("宿命旅途", text)
+
+    def test_plan_request_fits_window(self):
+        plan = plan_request(max_input=1000, max_tokens=200, context_window=2000)
+        self.assertEqual(plan["input_tokens"], 1000)
+        self.assertGreater(plan["max_tokens"], 0)
 
     def test_compose_system_short_is_plain_default(self):
         text = compose_system(kind="short")
         self.assertEqual(text, DEFAULT_SYSTEM)
         self.assertNotIn("CONTEXT PADDING", text)
-        self.assertNotIn("宿命旅途", text)
+        self.assertIn("宿命旅途", text)
 
-    def test_compose_system_long_pads_without_builtin_corpus(self):
-        text = compose_system(kind="long", input_tokens=400)
+    def test_compose_system_long_pads_with_game_bible(self):
+        text = compose_system(kind="long", input_tokens=8000)
         self.assertIn("CONTEXT PADDING", text)
-        self.assertNotIn("宿命旅途", text)
+        self.assertIn("宿命旅途", text)
 
     def test_compose_system_uses_custom_text_and_context_file(self):
         import tempfile

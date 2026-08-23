@@ -1,22 +1,26 @@
-"""并发对话引擎：一个 worker 一路聊天，一个 round 一次「用户输入 → 模型输出」。"""
+"""并发引擎：每一波拉起全量 worker；每人发一条命令。hit 原样再发，miss 换新命令。"""
 
 from __future__ import annotations
 
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from .config import PROJECT_DIR
 from .conversation import Conversation
-from .reporting import LiveFooter, WorkerBoard
+from .prompts import CONTEXT_WINDOW, estimate_tokens, pad_to_tokens
+from .reporting import LiveFooter, OutputLog, WorkerBoard
 from .stress import AdaptiveGate, StressStats
 from .transport import HttpStatusError, call_with_retries
 
 
-def slim_result(result: dict, worker: int, turn: int) -> dict:
+def slim_result(result: dict, worker: int, wave: int = 1) -> dict:
     slim = dict(result)
-    text = slim.pop("text", None) or ""
+    text = slim.get("text") or ""
+    slim["text"] = text
     slim["snippet"] = " ".join(str(text).split())[:80]
     slim["worker"] = int(worker)
-    slim["turn"] = int(turn)
+    slim["wave"] = int(wave)
+    slim["turn"] = int(wave)
     return slim
 
 
@@ -34,6 +38,7 @@ def turn_request(
     on_progress=None,
 ) -> dict:
     affinity = conversation.session_id
+    out_tokens = conversation.output_tokens_for()
 
     def once():
         return protocol.stream(
@@ -42,7 +47,7 @@ def turn_request(
             model,
             "",
             "",
-            max_tokens,
+            out_tokens,
             timeout,
             messages=conversation.outbound(),
             session_id=affinity,
@@ -57,18 +62,19 @@ def turn_request(
         rotate_session_on_retry=False,
     )
     result["session_id"] = affinity
+    result["planned_input"] = conversation.input_tokens_for()
+    result["planned_output"] = out_tokens
     return result
 
 
 def play_round(
     *,
     conversation: Conversation,
-    turn: int,
+    wave: int,
     protocol,
     base_url: str,
     api_key: str,
     model: str,
-    max_tokens: int,
     timeout: int,
     retries: int,
     retry_delay: float,
@@ -77,11 +83,19 @@ def play_round(
     stats: StressStats,
     gate: AdaptiveGate,
     stop,
+    output_log: OutputLog | None = None,
 ) -> dict | None:
-    """跑完一轮问答。429/5xx 会重试同一轮；硬错误返回 None。"""
     worker = conversation.worker_id + 1
-    board.begin_round(worker, turn)
-    progress = board.on_progress(worker, turn)
+    board.begin_round(worker, wave, wave=wave)
+    if output_log is not None:
+        output_log.start_step(
+            worker,
+            wave,
+            planned_input=conversation.input_tokens_for(),
+            planned_output=conversation.output_tokens_for(),
+        )
+    progress = board.on_progress(worker, wave)
+
     while not stop.is_set():
         if not gate.acquire(stop):
             return None
@@ -95,7 +109,7 @@ def play_round(
                 api_key=api_key,
                 model=model,
                 conversation=conversation,
-                max_tokens=max_tokens,
+                max_tokens=conversation.output_tokens_for(),
                 timeout=timeout,
                 retries=retries,
                 retry_delay=retry_delay,
@@ -105,33 +119,34 @@ def play_round(
             if exc.rate_limited:
                 stats.note_429()
                 gate.release(rate_limited=True)
-                board.fail_round(worker, turn, f"⚠️429 {exc}")
+                board.fail_round(worker, wave, f"⚠️429 {exc}", wave=wave)
                 time.sleep(exc.retry_after if exc.retry_after is not None else retry_delay)
                 if not stop.is_set():
-                    board.begin_round(worker, turn)
+                    board.begin_round(worker, wave, wave=wave)
                 continue
             if exc.capacity_limited:
                 stats.note_unavailable()
                 gate.release(rate_limited=False)
-                board.fail_round(worker, turn, f"⚠️5xx {exc}")
+                board.fail_round(worker, wave, f"⚠️5xx {exc}", wave=wave)
                 time.sleep(exc.retry_after if exc.retry_after is not None else retry_delay)
                 if not stop.is_set():
-                    board.begin_round(worker, turn)
+                    board.begin_round(worker, wave, wave=wave)
                 continue
             stats.fail()
             gate.release(rate_limited=False)
-            board.fail_round(worker, turn, f"❌ {exc}")
+            board.fail_round(worker, wave, f"❌ {exc}", wave=wave)
             return None
         except Exception as exc:
             stats.fail()
             gate.release(rate_limited=False)
-            board.fail_round(worker, turn, f"❌ {exc}")
+            board.fail_round(worker, wave, f"❌ {exc}", wave=wave)
             return None
-        conversation.commit(result.get("text") or "")
         stats.succeed(result)
         gate.release(rate_limited=False)
-        slim = slim_result(result, worker, turn)
-        board.finish_round(worker, turn, slim)
+        slim = slim_result(result, worker, wave)
+        board.finish_round(worker, wave, slim, wave=wave)
+        if output_log is not None:
+            output_log.finish_step(worker, wave, slim)
         return slim
     return None
 
@@ -139,17 +154,20 @@ def play_round(
 def play_worker(
     wid: int,
     *,
-    turns: int,
+    wave: int,
     system: str,
     user: str,
     followup: str,
     cache: bool,
     session_prefix: str,
+    max_input: int,
+    max_tokens: int,
+    context_window: int,
+    pad: bool,
     protocol,
     base_url: str,
     api_key: str,
     model: str,
-    max_tokens: int,
     timeout: int,
     retries: int,
     retry_delay: float,
@@ -158,6 +176,9 @@ def play_worker(
     stats: StressStats,
     gate: AdaptiveGate,
     stop,
+    output_log: OutputLog | None = None,
+    full_prefix: str = "",
+    full_tokens: int = 0,
 ) -> list[dict]:
     conversation = Conversation(
         wid,
@@ -166,37 +187,37 @@ def play_worker(
         cache=cache,
         session_prefix=session_prefix,
         followup=followup,
+        max_input=max_input,
+        max_tokens=max_tokens,
+        context_window=context_window,
+        pad=pad,
+        full_prefix=full_prefix or None,
+        full_tokens=full_tokens or None,
     )
-    rows: list[dict] = []
-    for turn in range(1, turns + 1):
-        if stop.is_set():
-            break
-        slim = play_round(
-            conversation=conversation,
-            turn=turn,
-            protocol=protocol,
-            base_url=base_url,
-            api_key=api_key,
-            model=model,
-            max_tokens=max_tokens,
-            timeout=timeout,
-            retries=retries,
-            retry_delay=retry_delay,
-            throttle=throttle,
-            board=board,
-            stats=stats,
-            gate=gate,
-            stop=stop,
-        )
-        if slim is not None:
-            rows.append(slim)
-    return rows
+    slim = play_round(
+        conversation=conversation,
+        wave=wave,
+        protocol=protocol,
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        timeout=timeout,
+        retries=retries,
+        retry_delay=retry_delay,
+        throttle=throttle,
+        board=board,
+        stats=stats,
+        gate=gate,
+        stop=stop,
+        output_log=output_log,
+    )
+    return [slim] if slim is not None else []
 
 
 def run_pool(
     *,
     workers: int,
-    turns: int,
+    rounds: int,
     duration: float,
     system: str,
     user: str,
@@ -212,67 +233,114 @@ def run_pool(
     retries: int,
     retry_delay: float,
     throttle: float,
+    max_input: int = 0,
+    context_window: int = CONTEXT_WINDOW,
+    pad: bool = True,
+    header: list[str] | None = None,
 ) -> tuple[list[dict], StressStats, AdaptiveGate]:
-    """拉起 workers 路对话，每路 turns 轮问答。"""
+    """rounds 波全量线程。hit：每一波发同一条命令。miss：每一波换新命令。"""
     import threading
 
     workers = max(int(workers), 1)
-    turns = max(int(turns), 1)
+    rounds = max(int(rounds), 1)
     stats = StressStats(workers=workers)
     gate = AdaptiveGate(workers)
     stop = threading.Event()
-    board = WorkerBoard(workers, rounds=turns)
-    footer = LiveFooter(stats=stats, board=board, gate=gate)
+    board = WorkerBoard(workers, waves=rounds)
+    shared_prefix = ""
+    shared_tokens = 0
+    if pad and max_input > 0:
+        shared_prefix = pad_to_tokens(
+            system,
+            max_input,
+            salt=session_prefix or "llm-bench" if cache else f"miss-{time.time_ns()}",
+            domain="宿命旅途",
+        )
+        shared_tokens = estimate_tokens(shared_prefix)
+    output_log = OutputLog(log_dir=PROJECT_DIR / "logs")
+    footer = LiveFooter(stats=stats, board=board, gate=gate, header=header)
     footer.start()
     rows: list[dict] = []
+    deadline = time.monotonic() + duration if duration > 0 else None
     try:
-        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="llm-bench") as pool:
-            futures = [
-                pool.submit(
-                    play_worker,
-                    wid,
-                    turns=turns,
-                    system=system,
-                    user=user,
-                    followup=followup,
-                    cache=cache,
-                    session_prefix=session_prefix,
-                    protocol=protocol,
-                    base_url=base_url,
-                    api_key=api_key,
-                    model=model,
-                    max_tokens=max_tokens,
-                    timeout=timeout,
-                    retries=retries,
-                    retry_delay=retry_delay,
-                    throttle=throttle,
-                    board=board,
-                    stats=stats,
-                    gate=gate,
-                    stop=stop,
-                )
-                for wid in range(workers)
-            ]
-            try:
-                if duration > 0:
-                    deadline = time.monotonic() + duration
-                    while time.monotonic() < deadline and any(
-                        not future.done() for future in futures
-                    ):
-                        time.sleep(0.2)
-                    stop.set()
-                for future in as_completed(futures):
-                    rows.extend(future.result() or [])
-            except KeyboardInterrupt:
+        for wave in range(1, rounds + 1):
+            if stop.is_set():
+                break
+            if deadline is not None and time.monotonic() >= deadline:
                 stop.set()
-                print("\n⏹ 收到中断，等待在途请求结束后输出统计", flush=True)
-                for future in as_completed(futures):
-                    try:
+                break
+            board.set_wave(wave)
+            wave_prefix = shared_prefix
+            wave_tokens = shared_tokens
+            if (not cache) and pad and max_input > 0:
+                wave_prefix = pad_to_tokens(
+                    system,
+                    max_input,
+                    salt=f"miss-{wave}-{time.time_ns()}",
+                    domain="宿命旅途",
+                )
+                wave_tokens = estimate_tokens(wave_prefix)
+            with ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix="llm-bench"
+            ) as pool:
+                futures = [
+                    pool.submit(
+                        play_worker,
+                        wid,
+                        wave=wave,
+                        system=system,
+                        user=user,
+                        followup=followup,
+                        cache=cache,
+                        session_prefix=session_prefix,
+                        max_input=max_input,
+                        max_tokens=max_tokens,
+                        context_window=context_window,
+                        pad=pad,
+                        protocol=protocol,
+                        base_url=base_url,
+                        api_key=api_key,
+                        model=model,
+                        timeout=timeout,
+                        retries=retries,
+                        retry_delay=retry_delay,
+                        throttle=throttle,
+                        board=board,
+                        stats=stats,
+                        gate=gate,
+                        stop=stop,
+                        output_log=output_log,
+                        full_prefix=wave_prefix,
+                        full_tokens=wave_tokens,
+                    )
+                    for wid in range(workers)
+                ]
+                try:
+                    if deadline is not None:
+                        while time.monotonic() < deadline and any(
+                            not future.done() for future in futures
+                        ):
+                            time.sleep(0.2)
+                        if time.monotonic() >= deadline:
+                            stop.set()
+                    for future in as_completed(futures):
                         rows.extend(future.result() or [])
-                    except Exception:
-                        pass
+                except KeyboardInterrupt:
+                    stop.set()
+                    print("\n⏹ 收到中断，等待在途请求结束后输出统计", flush=True)
+                    for future in as_completed(futures):
+                        try:
+                            rows.extend(future.result() or [])
+                        except Exception:
+                            pass
+                    break
     finally:
         stop.set()
         footer.stop()
-    rows.sort(key=lambda item: (int(item.get("worker") or 0), int(item.get("turn") or 0)))
+    rows.sort(
+        key=lambda item: (
+            int(item.get("wave") or 0),
+            int(item.get("worker") or 0),
+        )
+    )
     return rows, stats, gate

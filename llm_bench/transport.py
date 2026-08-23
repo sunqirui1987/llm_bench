@@ -15,6 +15,9 @@ from . import session
 
 _http: Optional[requests.Session] = None
 _http_lock = threading.Lock()
+_local = threading.local()
+_pool_size = 8
+SSE_CHUNK_SIZE = 256
 
 
 def headers(api_key: str, session_id: str | None = None) -> dict[str, str]:
@@ -34,24 +37,33 @@ def headers(api_key: str, session_id: str | None = None) -> dict[str, str]:
 
 
 def configure_pool(size: int) -> int:
-    """为并发流式请求准备连接池，避免默认 10 路把几百个线程卡住。"""
-    global _http
+    """记下并发规模。真正的 Session 按线程隔离，避免共享 Session 把请求串起来。"""
+    global _pool_size, _http
     size = max(int(size), 1)
-    adapter = HTTPAdapter(
-        pool_connections=size,
-        pool_maxsize=size,
-        max_retries=0,
-        pool_block=False,
-    )
-    http = requests.Session()
-    http.mount("http://", adapter)
-    http.mount("https://", adapter)
+    _pool_size = size
     with _http_lock:
         old = _http
-        _http = http
+        _http = None
     if old is not None:
         old.close()
     return size
+
+
+def thread_session() -> requests.Session:
+    """每个 worker 线程自己的 HTTP Session，一路一条连接。"""
+    http = getattr(_local, "http", None)
+    if http is None:
+        http = requests.Session()
+        adapter = HTTPAdapter(
+            pool_connections=2,
+            pool_maxsize=2,
+            max_retries=0,
+            pool_block=False,
+        )
+        http.mount("http://", adapter)
+        http.mount("https://", adapter)
+        _local.http = http
+    return http
 
 
 def raise_fd_limit(needed: int) -> int:
@@ -81,7 +93,7 @@ def post_stream(
     session_id: str | None = None,
 ):
     """发起流式 POST；响应的生命周期由协议适配器管理。"""
-    http = _http if _http is not None else requests
+    http = thread_session()
     return http.post(
         url,
         headers=headers(api_key, session_id),
@@ -152,7 +164,7 @@ def iter_sse_lines(
     try:
         # 小 chunk 避免 urllib3 默认的 512 字节缓冲：网关提前断流时，短 SSE
         # 可能尚未 yield 就随 ChunkedEncodingError 一起丢失。
-        for raw in response.iter_lines(chunk_size=1, decode_unicode=False):
+        for raw in response.iter_lines(chunk_size=SSE_CHUNK_SIZE, decode_unicode=False):
             terminal_received = terminal_received or is_terminal_line(raw)
             line = decode_line(raw)
             if line.startswith("event:"):

@@ -7,17 +7,12 @@
 #   "requests>=2.32,<3",
 # ]
 # ///
-"""通用 LLM Bench：N 路连续对话，测 cache / TTFT / token/s。
-
-端点：
-  chat       POST {chat_base_url}/v1/chat/completions
-  responses  POST {responses_base_url}/v1/responses
-  messages   POST {messages_base_url}/v1/messages
+"""LLM Bench：N 路同时发命令。hit=同一条命令再来；miss=每次都换新命令。
 
 示例：
-  uv run run.py bench --cache_mode hit --workers 1 --rounds 10
-  uv run run.py bench --cache_mode miss --workers 1 --rounds 10
-  uv run run.py cache --rounds 5
+  uv run run.py bench --cache_mode hit --workers 8 --rounds 2
+  uv run run.py bench --cache_mode miss --workers 8 --rounds 2
+  uv run run.py cache --rounds 2
 """
 
 import fire
