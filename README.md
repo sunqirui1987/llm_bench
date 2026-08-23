@@ -35,7 +35,10 @@ uv run run.py bench --formats chat,responses,messages --workers 2 --rounds 5
 uv run run.py cache --rounds 5
 ```
 
-`--workers 50 --rounds 5` = 50 路同时聊，**每路 5 轮**（共 250 次）。实时行会列出 `work1`…`work50` 和正在吐的 **out token / tok/s**。结束写入 `report.md`。
+- `--workers`：同时开几路**对话**（并发）
+- `--rounds`：每一路要问答多少轮（输入 → 输出 → 再输入 → 再输出）
+
+屏幕像 `top`：清屏刷新。每个 work 下面只显示**当前这一轮**。跑完写入 `report.md`（按 work 列出每一轮）。
 
 ## 常用参数
 

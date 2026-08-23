@@ -110,6 +110,35 @@ class StressStatsTest(unittest.TestCase):
         self.assertIn("work1", printed[1])
         self.assertIn("out=120", printed[1])
 
+    def test_live_footer_compose_is_short(self):
+        from llm_bench.reporting import LiveFooter, WorkerBoard
+
+        clock = Clock()
+        stats = StressStats(workers=3, window=15, now=clock)
+        board = WorkerBoard(3)
+        board.update(
+            1,
+            phase="stream",
+            turn=1,
+            ttft_ms=800,
+            out_tokens=120,
+            tok_s=40,
+            started=0.0,
+            input_tokens=1000,
+            cached_tokens=800,
+            cache_percent=80.0,
+            cache_turn=1,
+        )
+        board.update(2, phase="wait", turn=1, out_tokens=0, started=0.0)
+        footer = LiveFooter(stats=stats, board=board)
+        footer._tty = False
+        lines = footer._compose()
+        joined = "\n".join(lines)
+        self.assertIn("work1", joined)
+        self.assertIn("--round", joined)
+        self.assertIn("cache=80.0%", joined)
+        self.assertTrue(any(line.strip() == "work1" for line in lines))
+
 class AdaptiveGateTest(unittest.TestCase):
     def test_rate_limit_halves_pending_limit(self):
         gate = AdaptiveGate(8)

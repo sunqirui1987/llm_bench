@@ -35,6 +35,7 @@ from .reporting import (
     print_bench_header,
     print_bench_row,
     print_model_average,
+    LiveFooter,
     RoundLiveDisplay,
     WorkerBoard,
     print_summary,
@@ -289,11 +290,9 @@ def bench(
     use_live = workers <= 1
     use_ticker = workers > 1 and report_every > 0
     if use_live:
-        print("   report   : work1 当前轮实时刷新，结束打完整一行，并写 report.md")
+        print("   report   : work1 当前轮原地刷新；结束打完整一行，并写 report.md")
     else:
-        print(
-            f"   report   : 每轮打印 workN 完整行；每 {report_every}s 列出全部 worker 状态；写 report.md"
-        )
+        print("   report   : 完成一轮打一行 workN；底部 2 行原地显示在途 out/tok/s，不刷屏")
     print(f"   cache flow: {cache_flow}")
     prefix_tokens = estimate_tokens(system_text)
     print(
@@ -331,36 +330,35 @@ def bench(
             else:
                 print("   cache: miss · 无 session + 每轮打散前缀（cache% 应≈0，TTFT 应更高）")
             print(
-                f"   输出: {workers} 路 work1..work{workers}，每路 {rounds} 轮；"
-                "流式中刷实时 out token"
+                f"   画面: 像 top 清屏刷新。work=并发对话，"
+                f"每个 work 下面只显示当前 --round（每路共 {rounds} 轮问答）。",
+                flush=True,
             )
-            print_bench_header(show_cache=hit_cache)
 
             rows: list[dict] = []
             stats = StressStats(workers=workers)
             gate = AdaptiveGate(workers)
             stop = threading.Event()
-            board = WorkerBoard(workers)
-            error_shown = 0
             turns = max(int(rounds), 1)
+            board = WorkerBoard(workers, rounds=turns)
+            footer = LiveFooter(stats=stats, board=board, gate=gate)
+            error_shown = 0
 
             def store(result: dict) -> dict:
                 slim = dict(result)
-                slim.pop("text", None)
+                text = slim.pop("text", None) or ""
+                slim["snippet"] = " ".join(str(text).split())[:80]
                 return slim
 
             def emit_error(index: int, mark: str, exc: Exception, *, worker=1, turn=1) -> None:
                 nonlocal error_shown
-                with _print_lock:
-                    if verbose or per_round or error_shown < 8:
-                        print(
-                            f"{worker_label(worker):<8}{turn:<4}{mark} {exc}",
-                            flush=True,
-                        )
-                        error_shown += 1
-                    elif error_shown == 8:
-                        print("   … 后续同类错误不再逐条打印，看实时行的 429/5xx", flush=True)
-                        error_shown += 1
+                board.update(
+                    worker,
+                    phase="error",
+                    turn=turn,
+                    error=f"{mark} {exc}"[:80],
+                )
+                error_shown += 1
 
             def worker(wid: int) -> None:
                 conversation = Conversation(
@@ -375,29 +373,17 @@ def bench(
                 for turn_no in range(1, turns + 1):
                     if stop.is_set():
                         return
-                    live = (
-                        RoundLiveDisplay(turn_no, worker=worker_no, turn=turn_no)
-                        if use_live
-                        else None
-                    )
-                    live_done = False
-                    progress = (
-                        live.on_progress
-                        if live is not None
-                        else board.on_progress(worker_no, turn_no)
-                    )
+                    progress = board.on_progress(worker_no, turn_no)
                     board.update(
                         worker_no,
                         phase="wait",
                         turn=turn_no,
                         out_tokens=0,
                         tok_s=0.0,
+                        error="",
                         started=time.perf_counter(),
                     )
-                    if live is not None:
-                        live.start()
-                    try:
-                        while not stop.is_set():
+                    while not stop.is_set():
                             if not gate.acquire(stop):
                                 return
                             stats.begin()
@@ -426,14 +412,9 @@ def bench(
                                         stats.note_unavailable()
                                         gate.release(rate_limited=False)
                                         mark = "⚠️5xx"
-                                    if live is not None:
-                                        live.note(
-                                            f"{worker_label(worker_no):<8}{turn_no:<4}{mark} {exc}"
-                                        )
-                                    else:
-                                        emit_error(
-                                            turn_no, mark, exc, worker=worker_no, turn=turn_no
-                                        )
+                                    emit_error(
+                                        turn_no, mark, exc, worker=worker_no, turn=turn_no
+                                    )
                                     time.sleep(
                                         exc.retry_after if exc.retry_after is not None else retry_delay
                                     )
@@ -458,37 +439,27 @@ def bench(
                                 slim = store(result)
                                 slim["worker"] = worker_no
                                 slim["turn"] = turn_no
-                                row = format_bench_row(turn_no, slim, show_cache=hit_cache)
+                                inp = int(slim.get("input_tokens") or 0)
+                                cached = int(slim.get("cached_tokens") or 0)
+                                cache_pct = (100.0 * cached / inp) if inp > 0 else None
                                 board.update(
                                     worker_no,
                                     phase="idle",
                                     turn=turn_no,
+                                    done=turn_no,
                                     out_tokens=int(slim.get("output_tokens") or 0),
                                     tok_s=float(slim.get("output_tps") or 0),
+                                    input_tokens=inp,
+                                    cached_tokens=cached,
+                                    cache_percent=cache_pct,
+                                    cache_turn=turn_no,
                                     started=None,
                                 )
                                 with _print_lock:
                                     rows.append(slim)
-                                    if live is not None:
-                                        live.finish(row)
-                                        live_done = True
-                                    else:
-                                        print_bench_row(turn_no, slim, show_cache=hit_cache)
                                 break
-                    finally:
-                        if live is not None and not live_done:
-                            live.finish()
-
             reporter = None
-            if use_ticker:
-                reporter = StressReporter(
-                    stats,
-                    min(float(report_every), 1.0),
-                    limit_provider=lambda: gate.limit,
-                    show_cache=hit_cache,
-                )
-                reporter.board = board
-                reporter.start()
+            footer.start()
             try:
                 with ThreadPoolExecutor(
                     max_workers=workers,
@@ -510,6 +481,8 @@ def bench(
                         print("\n⏹ 收到中断，等待在途请求结束后输出统计", flush=True)
             finally:
                 stop.set()
+                if footer is not None:
+                    footer.stop()
                 if reporter is not None:
                     reporter.stop()
                     reporter.emit()
