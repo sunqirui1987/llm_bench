@@ -6,6 +6,8 @@ import time
 import uuid
 from pathlib import Path
 
+from .games import GAMES, pick_game
+
 
 CONTEXT_WINDOW = 500_000
 TOKEN_OVERHEAD = 2_048
@@ -39,86 +41,29 @@ DEFAULT_FOLLOWUP = (
     "从刚才停下的地方继续写这一场，不要重开，不要重复。写到输出上限。"
 )
 
-WORKER_STARTS = (
-    ("卡琳", "雷鸣区"),
-    ("麦琪", "霜原区"),
-    ("琳达", "暮港区"),
-    ("卡琳", "星砂区"),
-    ("麦琪", "雷鸣区"),
-    ("琳达", "霜原区"),
-    ("卡琳", "暮港区"),
-    ("麦琪", "星砂区"),
-    ("琳达", "雷鸣区"),
-    ("卡琳", "霜原区"),
-    ("麦琪", "暮港区"),
-    ("琳达", "星砂区"),
-    ("卡琳", "北境区"),
-    ("麦琪", "南风区"),
-    ("琳达", "内城区"),
-    ("卡琳", "外环区"),
-)
-WORKER_DOMAINS = tuple(f"{hero}@{zone}" for hero, zone in WORKER_STARTS)
-
-MISS_SCENES = (
-    ("麦琪", "霜原区", 2, 4, 3, "主线自动战斗首通"),
-    ("琳达", "暮港区", 6, 12, 5, "城镇酒馆与铁匠铺"),
-    ("卡琳", "星砂区", 9, 23, 1, "终焉神殿换到下一难度"),
-    ("麦琪", "雷鸣区", 11, 8, 2, "角色页觉醒与遗物四格"),
-    ("琳达", "霜原区", 14, 20, 4, "资源副本与离线挂机结算"),
-    ("卡琳", "暮港区", 3, 1, 5, "教堂天赋星图第一次打开"),
-    ("麦琪", "星砂区", 8, 16, 3, "竞技场入口刚从新手链解锁"),
-    ("琳达", "雷鸣区", 12, 10, 1, "神器子槽按出战位开放"),
-)
+WORKER_DOMAINS = tuple(game["title"] for game in GAMES)
 
 _PAD_BLOCKS = (
     (
-        "【主线坐标 {i:06d}】难度层 {layer} · 第 {chapter} 章 · 第 {stage} 关 · {domain}\n"
+        "【{domain} · {genre} · 卷 {i:06d}】\n"
         "salt={salt}\n"
-        "《宿命旅途》主线是难度层、章节、关卡三级坐标。共 15 层、每层 23 章、每章 5 个普通关，"
-        "合计 345 章、1725 个普通关。本段记录 {domain} 在该坐标的自动战斗：客户端逐帧演算，"
-        "服务端只做边界结算。currentStageId 必须等于服务端当前关，clearedStages 未落账不能切关。\n"
+        "{lore} 本条编号 {i:06d}。不要把别的游戏规则写进来。"
+        "layer={layer} chapter={chapter} stage={stage}。\n"
     ),
     (
-        "【初始伙伴 {i:06d}】{domain}\n"
+        "【{domain} 现场 {i:06d}】\n"
         "salt={salt}\n"
-        "开始界面选区服后，新玩家看开场与情景对话，再从卡琳、麦琪、琳达三人中选一名。"
-        "initialHeroId 写入区服档案，不能用其他游戏的英雄名顶替。出战槽随冒险等级开放，队伍最多五人。\n"
+        "{lore} 发生在条目 {i:06d}。时间、工具、限制都按本游戏。\n"
     ),
     (
-        "【页签 {i:06d}】角色 / 日志 / 战斗 / 城镇 / 副本 · {domain}\n"
+        "【{domain} 禁则 {i:06d}】\n"
         "salt={salt}\n"
-        "长期导航只有这五个页签。战斗是起始中心；日志、城镇、教堂天赋、酒馆、铁匠铺、"
-        "竞技场和副本沿新手事件链逐步打开，不是一份独立教程列表。\n"
+        "{lore} 违反条目 {i:06d} 必须停手并记录。\n"
     ),
     (
-        "【首通结算 {i:06d}】{domain}\n"
+        "【{domain} 交接 {i:06d}】\n"
         "salt={salt}\n"
-        "通关申报和切关申报必须分开。服务端先完成当前关首通，再检查下一关。"
-        "客户端自称更远的进度不能改写服务器正在挑战的位置。battleMode 区分首通与挂机。\n"
-    ),
-    (
-        "【构筑 {i:06d}】装备 / 天赋星图 / 神器 / 遗物 · {domain}\n"
-        "salt={salt}\n"
-        "装备管槽位属性、强化与洗练。天赋是星图。神器按出战位开放子槽。"
-        "遗物用四格形状放进逐步扩展的面板。20 名英雄、6 职业、12 个一转、24 个二转、每名 7 阶觉醒。\n"
-    ),
-    (
-        "【终焉神殿 {i:06d}】{domain}\n"
-        "salt={salt}\n"
-        "前 14 个难度层各有一场终焉神殿，打完才切到下一难度起点。这是进度状态机的换挡点，"
-        "不是普通关卡。资源副本把金币和遗物材料从主线里拆出去，形成短周期目标。\n"
-    ),
-    (
-        "【挂机与离线 {i:06d}】{domain}\n"
-        "salt={salt}\n"
-        "在线挂机和离线收益共用逐关基准，锚在主线进度。离线按 lastOnlineTime 只生成一次待领；"
-        "领成功后再移动时间锚点。断线先写下线时间并结算未入账的在线挂机，避免重连重复计算。\n"
-    ),
-    (
-        "【奖励申报 {i:06d}】{domain}\n"
-        "salt={salt}\n"
-        "客户端最多上报 30 条击杀，关卡必须等于服务端当前关。金币经验超上限截断。"
-        "装备和卷轴由服务端抽取，不接受客户端自带掉落。超速批次整批丢弃，回包仍成功、入账为零。\n"
+        "{lore} 交班只口头复述本游戏术语。编号 {i:06d}。\n"
     ),
 )
 
@@ -185,11 +130,7 @@ def game_bible() -> str:
 
 
 def worker_domain(worker_id: int) -> str:
-    return WORKER_DOMAINS[int(worker_id) % len(WORKER_DOMAINS)]
-
-
-def worker_start(worker_id: int) -> tuple[str, str]:
-    return WORKER_STARTS[int(worker_id) % len(WORKER_STARTS)]
+    return pick_game(worker_id)["title"]
 
 
 def _window_overhead(context_window: int) -> int:
@@ -234,16 +175,29 @@ def slice_to_tokens(text: str, target: int) -> str:
     return text[:n]
 
 
-def pad_to_tokens(text: str, target: int, *, salt: str = "stable", domain: str = "") -> str:
+def pad_to_tokens(
+    text: str,
+    target: int,
+    *,
+    salt: str = "stable",
+    domain: str = "",
+    genre: str = "",
+    lore: str = "",
+) -> str:
     """把文本填充到目标 token。同一 salt 得到同一前缀，便于缓存命中。"""
     target = max(int(target), 0)
     body = text or ""
     if estimate_tokens(body) >= target:
         return body
-    topic = domain or "卡琳@雷鸣区"
-    bible = game_bible()
-    if bible and "宿命旅途" not in body:
-        body = bible + body
+    topic = domain or "未命名游戏"
+    flavor = lore or topic
+    kind = genre or "游戏"
+    if topic == "宿命旅途":
+        bible = game_bible()
+        if bible and "宿命旅途" not in body:
+            body = bible + body
+            if estimate_tokens(body) >= target:
+                return body
     parts = [body.rstrip(), "\n===== CONTEXT PADDING =====\n"]
     current = estimate_tokens("".join(parts))
 
@@ -253,6 +207,8 @@ def pad_to_tokens(text: str, target: int, *, salt: str = "stable", domain: str =
             i=index,
             salt=salt,
             domain=topic,
+            genre=kind,
+            lore=flavor,
             layer=(index % 15) + 1,
             chapter=(index % 23) + 1,
             stage=(index % 5) + 1,
@@ -292,7 +248,7 @@ def compose_system(
     if context:
         body = context + body
     if (kind or "short").strip().lower() == "long":
-        return pad_to_tokens(body, input_tokens, salt=salt)
+        return pad_to_tokens(body, input_tokens, salt=salt, domain="宿命旅途", genre="竖屏放置卡牌")
     return body
 
 
@@ -304,9 +260,31 @@ def compose_user(prompt: str = "", prompt_file: str = "") -> str:
     return body or DEFAULT_USER
 
 
-def build_hit_user(template: str = "", extra: str = "") -> str:
-    """命中缓存用的同一条命令：每一波字节都一样。"""
-    body = (template or "").strip() or DEFAULT_USER
+def game_prefix(worker_id: int, base_system: str, max_input: int, salt: str) -> str:
+    """按 worker 生成该游戏自己的长前缀，不和其他 work 共用。"""
+    game = pick_game(worker_id)
+    body = "\n".join(part for part in (game["system"], (base_system or "").strip()) if part)
+    if game["title"] == "宿命旅途":
+        bible = game_bible()
+        if bible:
+            body = bible + body
+    return pad_to_tokens(
+        body,
+        max_input,
+        salt=salt,
+        domain=game["title"],
+        genre=game["genre"],
+        lore=game["lore"],
+    )
+
+
+def build_hit_user(template: str = "", extra: str = "", worker_id: int = 0) -> str:
+    """命中缓存：这个 worker 自己那款游戏的命令，每一波字节都一样。"""
+    custom = (template or "").strip()
+    if custom and custom != DEFAULT_USER:
+        body = custom
+    else:
+        body = pick_game(worker_id)["command"]
     extra = (extra or "").strip()
     if extra:
         return f"{body}\n{extra}"
@@ -320,19 +298,18 @@ def build_miss_user(
     seq: int = 1,
     extra: str = "",
 ) -> str:
-    """不走缓存：每次换一场、换坐标、换盐，命令本身就不同。"""
-    hero, zone, layer, chapter, stage, scene = MISS_SCENES[
-        (int(worker_id) + int(seq)) % len(MISS_SCENES)
-    ]
+    """不走缓存：仍是这个 worker 的游戏，但每次换一场新命令。"""
+    game = pick_game(worker_id)
+    beats = game["miss"]
+    beat = beats[(int(seq) - 1) % len(beats)]
     salt = unique_salt()
     parts = [
         f"本场命令编号 {salt}",
-        f"区服 {zone}，初始伙伴 {hero}。",
-        f"主线坐标：难度层 {layer}、第 {chapter} 章、第 {stage} 关。",
-        f"这一场要演：{scene}。",
-        "按《宿命旅途》档案写完，不要问是否继续，写到输出上限。",
-        "字段用 currentStageId、clearedStages、battleMode、roster、team、lastOnlineTime。",
-        f"不要复用上一场的对白、掉落和结算。seq={seq} worker={worker_id:03d}",
+        f"游戏《{game['title']}》（{game['genre']}）。",
+        f"这一场要演：{beat}。",
+        game["system"],
+        "不要问是否继续，写到输出上限。不要写成别的游戏。",
+        f"seq={seq} worker={worker_id:03d}",
     ]
     custom = (template or "").strip()
     if custom and custom != DEFAULT_USER:

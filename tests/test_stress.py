@@ -115,11 +115,13 @@ class StressStatsTest(unittest.TestCase):
 
         clock = Clock()
         stats = StressStats(workers=3, window=15, now=clock)
-        board = WorkerBoard(3)
+        board = WorkerBoard(3, waves=3)
+        board.wave = 2
         board.update(
             1,
             phase="stream",
-            turn=1,
+            turn=2,
+            wave=2,
             ttft_ms=800,
             out_tokens=120,
             tok_s=40,
@@ -127,16 +129,16 @@ class StressStatsTest(unittest.TestCase):
             input_tokens=1000,
             cached_tokens=800,
             cache_percent=80.0,
-            cache_turn=1,
+            cache_turn=2,
         )
-        board.update(2, phase="wait", turn=1, out_tokens=0, started=0.0)
+        board.update(2, phase="wait", turn=1, wave=1, out_tokens=0, started=0.0)
         footer = LiveFooter(stats=stats, board=board)
         footer._tty = False
         lines = footer._compose()
         joined = "\n".join(lines)
         self.assertIn("work1", joined)
-        self.assertIn("第", joined)
-        self.assertIn("次", joined)
+        self.assertIn("缓存", joined)
+        self.assertIn("预热", joined)
         self.assertIn("cache=80.0%", joined)
         self.assertNotIn("快捷键", joined)
         self.assertTrue(any(line.strip() == "work1" for line in lines))
@@ -163,6 +165,17 @@ class StressStatsTest(unittest.TestCase):
         self.assertIn("LLM Bench · 不要缓存  workers=10（一波全量线程）", out)
         self.assertEqual(out.count("work1"), 1)
         self.assertNotIn("快捷键", out)
+
+    def test_live_tail_lines_shrinks_for_many_workers(self):
+        import os
+        from unittest.mock import patch
+
+        from llm_bench.reporting import live_tail_lines
+
+        size = os.terminal_size((80, 24))
+        with patch("llm_bench.reporting.shutil.get_terminal_size", return_value=size):
+            self.assertEqual(live_tail_lines(1, header_lines=5), 4)
+            self.assertEqual(live_tail_lines(10, header_lines=18), 0)
 
     def test_output_log_is_silent_and_writes_file(self):
         import tempfile

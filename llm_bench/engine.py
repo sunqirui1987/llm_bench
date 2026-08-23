@@ -7,8 +7,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .config import PROJECT_DIR
 from .conversation import Conversation
-from .prompts import CONTEXT_WINDOW, estimate_tokens, pad_to_tokens
-from .reporting import LiveFooter, OutputLog, WorkerBoard
+from .prompts import CONTEXT_WINDOW, estimate_tokens, game_prefix, pick_game
+from .reporting import LiveFooter, OutputLog, WorkerBoard, live_tail_lines
 from .stress import AdaptiveGate, StressStats
 from .transport import HttpStatusError, call_with_retries
 
@@ -36,9 +36,12 @@ def turn_request(
     retries: int,
     retry_delay: float,
     on_progress=None,
+    messages: list | None = None,
 ) -> dict:
     affinity = conversation.session_id
     out_tokens = conversation.output_tokens_for()
+    if messages is None:
+        messages = conversation.outbound()
 
     def once():
         return protocol.stream(
@@ -49,7 +52,7 @@ def turn_request(
             "",
             out_tokens,
             timeout,
-            messages=conversation.outbound(),
+            messages=messages,
             session_id=affinity,
             on_progress=on_progress,
         )
@@ -86,7 +89,12 @@ def play_round(
     output_log: OutputLog | None = None,
 ) -> dict | None:
     worker = conversation.worker_id + 1
-    board.begin_round(worker, wave, wave=wave)
+    board.begin_round(
+        worker,
+        wave,
+        wave=wave,
+        game=getattr(conversation, "game_title", ""),
+    )
     if output_log is not None:
         output_log.start_step(
             worker,
@@ -95,6 +103,7 @@ def play_round(
             planned_output=conversation.output_tokens_for(),
         )
     progress = board.on_progress(worker, wave)
+    messages = conversation.outbound()
 
     while not stop.is_set():
         if not gate.acquire(stop):
@@ -114,6 +123,7 @@ def play_round(
                 retries=retries,
                 retry_delay=retry_delay,
                 on_progress=progress,
+                messages=messages,
             )
         except HttpStatusError as exc:
             if exc.rate_limited:
@@ -122,7 +132,12 @@ def play_round(
                 board.fail_round(worker, wave, f"⚠️429 {exc}", wave=wave)
                 time.sleep(exc.retry_after if exc.retry_after is not None else retry_delay)
                 if not stop.is_set():
-                    board.begin_round(worker, wave, wave=wave)
+                    board.begin_round(
+                        worker,
+                        wave,
+                        wave=wave,
+                        game=getattr(conversation, "game_title", ""),
+                    )
                 continue
             if exc.capacity_limited:
                 stats.note_unavailable()
@@ -130,7 +145,12 @@ def play_round(
                 board.fail_round(worker, wave, f"⚠️5xx {exc}", wave=wave)
                 time.sleep(exc.retry_after if exc.retry_after is not None else retry_delay)
                 if not stop.is_set():
-                    board.begin_round(worker, wave, wave=wave)
+                    board.begin_round(
+                        worker,
+                        wave,
+                        wave=wave,
+                        game=getattr(conversation, "game_title", ""),
+                    )
                 continue
             stats.fail()
             gate.release(rate_limited=False)
@@ -193,6 +213,7 @@ def play_worker(
         pad=pad,
         full_prefix=full_prefix or None,
         full_tokens=full_tokens or None,
+        seq=max(int(wave) - 1, 0),
     )
     slim = play_round(
         conversation=conversation,
@@ -247,16 +268,19 @@ def run_pool(
     gate = AdaptiveGate(workers)
     stop = threading.Event()
     board = WorkerBoard(workers, waves=rounds)
-    shared_prefix = ""
-    shared_tokens = 0
+    board.tail_lines = live_tail_lines(workers, header_lines=len(header or []) + 4)
+    worker_prefixes = [""] * workers
+    worker_tokens = [0] * workers
     if pad and max_input > 0:
-        shared_prefix = pad_to_tokens(
-            system,
-            max_input,
-            salt=session_prefix or "llm-bench" if cache else f"miss-{time.time_ns()}",
-            domain="宿命旅途",
-        )
-        shared_tokens = estimate_tokens(shared_prefix)
+        for wid in range(workers):
+            game = pick_game(wid)
+            salt = (
+                f"{session_prefix}|{game['title']}"
+                if cache
+                else f"miss-{wid}-{session_prefix}"
+            )
+            worker_prefixes[wid] = game_prefix(wid, system, max_input, salt)
+            worker_tokens[wid] = estimate_tokens(worker_prefixes[wid])
     output_log = OutputLog(log_dir=PROJECT_DIR / "logs")
     footer = LiveFooter(stats=stats, board=board, gate=gate, header=header)
     footer.start()
@@ -270,16 +294,6 @@ def run_pool(
                 stop.set()
                 break
             board.set_wave(wave)
-            wave_prefix = shared_prefix
-            wave_tokens = shared_tokens
-            if (not cache) and pad and max_input > 0:
-                wave_prefix = pad_to_tokens(
-                    system,
-                    max_input,
-                    salt=f"miss-{wave}-{time.time_ns()}",
-                    domain="宿命旅途",
-                )
-                wave_tokens = estimate_tokens(wave_prefix)
             with ThreadPoolExecutor(
                 max_workers=workers, thread_name_prefix="llm-bench"
             ) as pool:
@@ -310,8 +324,8 @@ def run_pool(
                         gate=gate,
                         stop=stop,
                         output_log=output_log,
-                        full_prefix=wave_prefix,
-                        full_tokens=wave_tokens,
+                        full_prefix=worker_prefixes[wid],
+                        full_tokens=worker_tokens[wid],
                     )
                     for wid in range(workers)
                 ]

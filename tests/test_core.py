@@ -11,7 +11,7 @@ from llm_bench import session
 from llm_bench.config import resolve_base_urls
 from llm_bench.metrics import StreamMeasurement
 from llm_bench.prompts import pad_to_tokens
-from llm_bench.reporting import cache_percent
+from llm_bench.reporting import aggregate_cache_percent, cache_percent
 from llm_bench.transport import (
     HttpStatusError,
     call_with_retries,
@@ -70,6 +70,52 @@ class CoreTest(unittest.TestCase):
                 }
             ).strip(),
             "0.0%",
+        )
+
+    def test_aggregate_cache_skips_first_request(self):
+        rows = [
+            {
+                "wave": 1,
+                "input_tokens": 1000,
+                "cached_tokens": 0,
+                "cache_reported": True,
+            },
+            {
+                "wave": 2,
+                "input_tokens": 1000,
+                "cached_tokens": 1000,
+                "cache_reported": True,
+            },
+            {
+                "wave": 3,
+                "input_tokens": 1000,
+                "cached_tokens": 1000,
+                "cache_reported": True,
+            },
+        ]
+        self.assertEqual(aggregate_cache_percent(rows).strip(), "66.7%")
+        self.assertEqual(
+            aggregate_cache_percent(rows, skip_first=True).strip(), "100.0%"
+        )
+
+    def test_first_wave_cache_label_is_warmup(self):
+        from llm_bench.reporting import _round_cache_label
+
+        self.assertEqual(
+            _round_cache_label({"wave": 1, "input_tokens": 1000, "cached_tokens": 0}),
+            "预热·不计命中",
+        )
+        self.assertIn(
+            "cache=100.0%",
+            _round_cache_label(
+                {
+                    "wave": 2,
+                    "input_tokens": 1000,
+                    "cached_tokens": 1000,
+                    "cache_turn": 2,
+                },
+                turn=2,
+            ),
         )
 
     def test_allow_incomplete_recovers_progressed_stream(self):

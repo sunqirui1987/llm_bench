@@ -11,7 +11,8 @@ from .prompts import (
     bust_prefix,
     clamp_output_tokens,
     estimate_tokens,
-    pad_to_tokens,
+    game_prefix,
+    pick_game,
 )
 
 
@@ -37,6 +38,7 @@ class Conversation:
         pad: bool | None = None,
         full_prefix: str | None = None,
         full_tokens: int | None = None,
+        seq: int = 0,
     ):
         self.worker_id = int(worker_id)
         self.cache = bool(cache)
@@ -49,19 +51,25 @@ class Conversation:
         self.max_input = max(int(max_input), 0)
         self.max_tokens = max(int(max_tokens), 1)
         self.context_window = max(int(context_window), 1)
-        self.seq = 0
+        self.seq = max(int(seq), 0)
+        self.game = pick_game(self.worker_id)
+        self.game_title = self.game["title"]
         should_pad = bool(self.max_input) if pad is None else bool(pad)
         if full_prefix:
             self.full_prefix = full_prefix
         elif should_pad and self.max_input:
-            self.full_prefix = pad_to_tokens(
+            self.full_prefix = game_prefix(
+                self.worker_id,
                 system or "",
                 self.max_input,
-                salt=session_prefix if self.cache else f"miss-{self.uid}",
-                domain="宿命旅途",
+                salt=(
+                    f"{session_prefix}|{self.game_title}"
+                    if self.cache
+                    else f"miss-{self.uid}"
+                ),
             )
         else:
-            self.full_prefix = system or ""
+            self.full_prefix = system or self.game["system"]
         self.full_tokens = (
             max(int(full_tokens), 1)
             if full_tokens
@@ -73,7 +81,11 @@ class Conversation:
                 {"role": "system", "content": self.full_prefix},
                 {
                     "role": "user",
-                    "content": build_hit_user(self.user_template, extra=self.followup),
+                    "content": build_hit_user(
+                        self.user_template,
+                        extra=self.followup,
+                        worker_id=self.worker_id,
+                    ),
                 },
             ]
 

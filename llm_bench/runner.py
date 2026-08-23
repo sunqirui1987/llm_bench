@@ -122,17 +122,19 @@ def _print_start(
     max_tokens: int,
     max_input: int,
     context_window: int,
-    plan: list[dict],
+    plan: dict,
+    pad: bool,
+    custom_prompt: bool,
 ) -> list[str]:
     total = workers * max(int(rounds), 0)
     if hit_cache:
         title = "LLM Bench · 要缓存"
         session_desc = f"每路钉死一条 session（示例 {initial_session}）"
-        cache_flow = "同一条命令原样再发。第 1 次冷启，第 2 次起应对上 cache"
+        cache_flow = "第1次预热（冷启动，不计命中率）；第2次起同一条命令再发，测 cache"
     else:
         title = "LLM Bench · 不要缓存"
         session_desc = "不带 session"
-        cache_flow = "每一次都是一条新命令：换盐、换场景、换坐标"
+        cache_flow = "每一次都换新命令：换盐、换场面；游戏仍按 work 分开"
     lines = [
         "═" * 88,
         (
@@ -159,11 +161,15 @@ def _print_start(
             ),
         ]
     )
-    prefix_tokens = estimate_tokens(system_text)
     lines.append(
-        f"   system    : {system}  指令 {len(system_text)} 字 / {prefix_tokens} token"
+        f"   prefix    : {'按每路游戏填到 '+str(plan['input_tokens'])+' token' if pad else '短指令，不填充'}"
     )
-    lines.append(f"   prompt    : {prompt[:50]}{'...' if len(prompt) > 50 else ''}")
+    if custom_prompt:
+        lines.append(
+            f"   prompt    : 自定义（覆盖所有 work） {prompt[:50]}{'...' if len(prompt) > 50 else ''}"
+        )
+    else:
+        lines.append("   prompt    : 每路一款游戏自己的开场命令（games.py）")
     if hit_cache and max_input < 2048:
         lines.append(
             f"⚠️ cache_mode=hit 但 system 只有 {max_input} token，"
@@ -231,6 +237,10 @@ def bench(
         context_window=context_window,
     )
     pad = (system or "long").strip().lower() != "short"
+    custom_prompt = bool(str(prompt_file or "").strip()) or (
+        bool((prompt or "").strip())
+        and (prompt or "").strip() != (DEFAULT_PROMPT or "").strip()
+    )
     system_text, prompt, followup_text = _build_prompts(
         system="short",
         system_prompt=system_prompt,
@@ -241,6 +251,7 @@ def bench(
         context_file=context_file,
         input_tokens=max_input,
     )
+    user_for_pool = prompt if custom_prompt else ""
     workers = max(int(workers), 1)
     duration = max(float(duration), 0.0)
     fd_limit = raise_fd_limit(workers * 8 + 256)
@@ -266,6 +277,8 @@ def bench(
         max_input=max_input,
         context_window=context_window,
         plan=plan,
+        pad=pad,
+        custom_prompt=custom_prompt,
     )
 
     summary: dict = {}
@@ -284,7 +297,7 @@ def bench(
                 rounds=int(rounds),
                 duration=duration,
                 system=system_text,
-                user=prompt,
+                user=user_for_pool,
                 followup=followup_text,
                 cache=hit_cache,
                 session_prefix=initial_session or "llm-bench",
@@ -304,11 +317,19 @@ def bench(
             )
             snap = stats.snapshot()
             snapshots[(format_name, model)] = snap
-            print_stress_summary(snap, limit=gate.limit, show_cache=hit_cache)
-            if not hit_cache and snap.ok and snap.cache_percent > 5:
-                print(
-                    f"⚠️ cache_mode=miss 已打散前缀但仍有 {snap.cache_percent:.1f}% 命中"
-                )
+            print_stress_summary(
+                snap, limit=gate.limit, show_cache=hit_cache, rows=rows
+            )
+            warm_hit = aggregate_cache_percent(rows, skip_first=True).strip()
+            if not hit_cache and rows:
+                try:
+                    warm_pct = float(warm_hit.replace("%", "").strip())
+                except ValueError:
+                    warm_pct = 0.0
+                if warm_pct > 5:
+                    print(
+                        f"⚠️ cache_mode=miss 第2次起仍有 {warm_pct:.1f}% 命中"
+                    )
             if not rows:
                 print("⚠️ 没有成功样本")
                 continue
@@ -378,6 +399,10 @@ def cache(
     context_window = max(int(context_window), 1)
     max_tokens = max(int(max_tokens), 1)
     max_input = fit_max_input(input_tokens, max_tokens, context_window)
+    custom_prompt = bool(str(prompt_file or "").strip()) or (
+        bool((prompt or "").strip())
+        and (prompt or "").strip() != (DEFAULT_PROMPT or "").strip()
+    )
     system_text, prompt, followup_text = _build_prompts(
         system="short",
         system_prompt=system_prompt,
@@ -388,14 +413,8 @@ def cache(
         context_file=context_file,
         input_tokens=max_input,
     )
+    user_for_pool = prompt if custom_prompt else ""
     configure_pool(1)
-    print(f"\n{'═' * 88}")
-    print(
-        f"LLM Bench · 缓存冷启诊断  1 路把同一条命令连发 {rounds} 次"
-    )
-    print(f"   responses : {base_urls['responses']}")
-    print(f"   session   : {active_session}")
-    print(f"{'═' * 88}")
     for format_name in formats:
         protocol = PROTOCOLS[format_name]
         protocol_base = base_urls[format_name]
@@ -403,13 +422,20 @@ def cache(
             model_session = session.configure(
                 session.scoped(active_session, format_name, model)
             )
-            print(f"\n▶ {format_name}  {model}  session={model_session}")
+            header = [
+                "═" * 88,
+                f"LLM Bench · 缓存冷启诊断  1 路把同一条命令连发 {rounds} 次",
+                f"   responses : {base_urls['responses']}",
+                f"   session   : {model_session}",
+                "═" * 88,
+                f"▶ {format_name}  {model}  session={model_session}",
+            ]
             rows, stats, gate = run_pool(
                 workers=1,
                 rounds=int(rounds),
                 duration=0,
                 system=system_text,
-                user=prompt,
+                user=user_for_pool,
                 followup=followup_text,
                 cache=True,
                 session_prefix=model_session,
@@ -425,8 +451,11 @@ def cache(
                 max_input=max_input,
                 context_window=context_window,
                 pad=True,
+                header=header,
             )
-            print_stress_summary(stats.snapshot(), limit=gate.limit, show_cache=True)
+            print_stress_summary(
+                stats.snapshot(), limit=gate.limit, show_cache=True, rows=rows
+            )
             if not rows:
                 print("❌ 全部失败")
                 continue

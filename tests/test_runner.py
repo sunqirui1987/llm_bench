@@ -9,8 +9,11 @@ from llm_bench import session
 from llm_bench.config import parse_cache_mode
 from llm_bench.conversation import Conversation
 from llm_bench.engine import run_pool
+import requests
+
 from llm_bench.runner import _turn_request, bench
 from llm_bench.transport import configure_pool, raise_fd_limit
+import llm_bench.transport as transport
 
 
 def result(cache_percent: float) -> dict:
@@ -114,6 +117,42 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(captured[0]["messages"], captured[1]["messages"])
         self.assertEqual(first["session_id"], conv.session_id)
         self.assertEqual(second["session_id"], conv.session_id)
+
+    def test_connection_retry_reuses_the_same_miss_payload(self):
+        class Flaky(CaptureProtocol):
+            def __init__(self):
+                super().__init__()
+                self.calls = 0
+
+            def stream(self, *args, messages=None, session_id="", **kwargs):
+                self.calls += 1
+                self.captured.append(messages)
+                if self.calls == 1:
+                    raise requests.exceptions.ConnectionError("boom")
+                payload = result(0)
+                payload["session_id"] = session_id
+                return payload
+
+        proto = Flaky()
+        original_sleep = transport.time.sleep
+        transport.time.sleep = lambda _seconds: None
+        try:
+            conv = Conversation(0, system="sys", user="hello", cache=False)
+            _turn_request(
+                protocol=proto,
+                base_url="https://example.test",
+                api_key="key",
+                model="model",
+                conversation=conv,
+                max_tokens=64,
+                timeout=30,
+                retries=1,
+                retry_delay=0,
+            )
+        finally:
+            transport.time.sleep = original_sleep
+        self.assertEqual(proto.calls, 2)
+        self.assertEqual(proto.captured[0], proto.captured[1])
 
     def test_miss_sends_a_new_command_and_no_session(self):
         protocol = CaptureProtocol()
@@ -271,8 +310,15 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual({row["wave"] for row in rows}, {1, 2})
         self.assertNotIn("step", rows[0])
         self.assertEqual(len(protocol.captured), 4)
-        bodies = [item["messages"] for item in protocol.captured]
-        self.assertTrue(all(item == bodies[0] for item in bodies))
+        by_session: dict[str, list] = {}
+        for item in protocol.captured:
+            by_session.setdefault(item["session_id_arg"], []).append(item["messages"])
+        self.assertEqual(len(by_session), 2)
+        for messages in by_session.values():
+            self.assertGreaterEqual(len(messages), 1)
+            self.assertTrue(all(item == messages[0] for item in messages))
+        sessions = list(by_session)
+        self.assertNotEqual(by_session[sessions[0]][0], by_session[sessions[1]][0])
 
 
 if __name__ == "__main__":

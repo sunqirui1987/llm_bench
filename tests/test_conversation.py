@@ -5,9 +5,9 @@ from __future__ import annotations
 import unittest
 
 from llm_bench.conversation import Conversation
+from llm_bench.games import GAMES
 from llm_bench.prompts import (
     DEFAULT_SYSTEM,
-    MISS_SCENES,
     clip_text,
     compose_system,
     compose_user,
@@ -48,19 +48,30 @@ class ConversationTest(unittest.TestCase):
         self.assertNotEqual(first[1]["content"], second[1]["content"])
         self.assertEqual(len(first), 2)
 
-    def test_hit_does_not_put_worker_id_into_the_command(self):
-        a = Conversation(0, system="sys", user="", cache=True).outbound()
-        b = Conversation(1, system="sys", user="", cache=True).outbound()
-        self.assertEqual(a[1]["content"], b[1]["content"])
-        self.assertEqual(a[0]["content"], b[0]["content"])
+    def test_each_worker_plays_a_different_game(self):
+        titles = {game["title"] for game in GAMES}
+        self.assertGreaterEqual(len(titles), 10)
+        a = Conversation(0, system="", user="", cache=True).outbound()
+        b = Conversation(1, system="", user="", cache=True).outbound()
+        self.assertNotEqual(a[1]["content"], b[1]["content"])
+        self.assertIn("卡琳", a[1]["content"])
+        self.assertIn("潮汐港务", b[0]["content"] + b[1]["content"])
 
-    def test_miss_scenes_cover_different_game_beats(self):
-        self.assertGreaterEqual(len(set(MISS_SCENES)), 5)
-        seen = set()
-        conv = Conversation(0, system="sys", user="", cache=False)
-        for _ in range(8):
-            seen.add(conv.outbound()[1]["content"].splitlines()[2])
-        self.assertGreater(len(seen), 1)
+    def test_miss_seq_rotates_scene_across_waves(self):
+        a = Conversation(1, system="", user="", cache=False, seq=0).outbound()[1]["content"]
+        b = Conversation(1, system="", user="", cache=False, seq=1).outbound()[1]["content"]
+        self.assertIn("潮汐港务", a)
+        self.assertIn("潮汐港务", b)
+        self.assertIn("雾天", a)
+        self.assertIn("渔汛", b)
+
+    def test_miss_stays_in_the_same_game_but_changes_the_command(self):
+        conv = Conversation(1, system="", user="", cache=False)
+        first = conv.outbound()[1]["content"]
+        second = conv.outbound()[1]["content"]
+        self.assertIn("潮汐港务", first)
+        self.assertIn("潮汐港务", second)
+        self.assertNotEqual(first, second)
 
     def test_followup_is_appended_to_the_same_hit_command(self):
         conv = Conversation(
@@ -117,12 +128,18 @@ class ConversationTest(unittest.TestCase):
         self.assertIn("BASE", first)
         self.assertIn("CONTEXT PADDING", first)
 
-    def test_pad_blocks_are_destiny_journey_scenes(self):
-        text = pad_to_tokens("BASE", 8000, salt="mix", domain="卡琳@雷鸣区")
-        self.assertIn("主线坐标", text)
-        self.assertIn("终焉神殿", text)
-        self.assertIn("首通结算", text)
-        self.assertIn("宿命旅途", text)
+    def test_pad_blocks_carry_the_named_game(self):
+        text = pad_to_tokens(
+            "BASE",
+            8000,
+            salt="mix",
+            domain="潮汐港务",
+            genre="海港调度模拟",
+            lore="泊位分深浅。",
+        )
+        self.assertIn("潮汐港务", text)
+        self.assertIn("泊位分深浅", text)
+        self.assertNotIn("卡琳", text)
 
     def test_plan_request_fits_window(self):
         plan = plan_request(max_input=1000, max_tokens=200, context_window=2000)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 import sys
 import threading
 import time
@@ -34,9 +35,19 @@ def cache_percent(result: dict) -> str:
     )
 
 
-def aggregate_cache_percent(rows: list[dict]) -> str:
+def is_first_request(row: dict) -> bool:
+    return int(row.get("wave") or row.get("turn") or 1) <= 1
+
+
+def warm_rows(rows: list[dict]) -> list[dict]:
+    """去掉每个 worker 的第 1 次（冷启动），只留同样命令再来的样本。"""
+    return [row for row in rows if not is_first_request(row)]
+
+
+def aggregate_cache_percent(rows: list[dict], *, skip_first: bool = False) -> str:
+    sample = warm_rows(rows) if skip_first else rows
     reported = [
-        row for row in rows
+        row for row in sample
         if row["cache_reported"] and row["input_tokens"] > 0
     ]
     if not reported:
@@ -76,6 +87,18 @@ OUTPUT_TAIL_LINES = 4
 OUTPUT_TAIL_WIDTH = 86
 
 
+def live_tail_lines(workers: int, header_lines: int = 18) -> int:
+    """按终端高度给每个 work 分尾部行数，避免 10 路把屏幕顶出去。"""
+    workers = max(int(workers), 1)
+    try:
+        rows = int(shutil.get_terminal_size(fallback=(80, 40)).lines)
+    except Exception:
+        rows = 40
+    budget = max(int(rows) - int(header_lines) - 2, workers * 2)
+    per = budget // workers - 2
+    return max(0, min(OUTPUT_TAIL_LINES, per))
+
+
 class OutputLog:
     """不往控制台打字。结束时把全文写入 logs/，面板自己刷。"""
 
@@ -112,6 +135,9 @@ def _step_label(worker: int, wave: int, step: int, steps: int) -> str:
 
 
 def _round_cache_label(state: dict, turn: int | None = None) -> str:
+    wave = int(state.get("wave") or turn or 1)
+    if wave <= 1:
+        return "预热·不计命中"
     inp = int(state.get("input_tokens") or 0)
     cached = int(state.get("cached_tokens") or 0)
     pct = state.get("cache_percent")
@@ -120,13 +146,11 @@ def _round_cache_label(state: dict, turn: int | None = None) -> str:
         pct = 100.0 * cached / inp
         text = f"cache={pct:.1f}% ({cached}/{inp})"
     elif pct is None:
-        return "cache=—"
+        return "等命中结果"
     else:
         text = f"cache={float(pct):.1f}%"
     if cache_turn and turn and cache_turn != turn:
         return f"上轮 {text}"
-    if cache_turn:
-        return f"本轮 {text}"
     return text
 
 
@@ -176,6 +200,8 @@ class WorkerBoard:
         self.steps = self.waves
         self.rounds = self.waves
         self.wave = 1
+        self.tail_lines = OUTPUT_TAIL_LINES
+        self.finished: list[dict] = []
         self._lock = threading.Lock()
         self._states = {
             i: {
@@ -193,6 +219,7 @@ class WorkerBoard:
                 "cached_tokens": 0,
                 "cache_percent": None,
                 "text": "",
+                "game": "",
             }
             for i in range(1, self.workers + 1)
         }
@@ -203,12 +230,19 @@ class WorkerBoard:
             for state in self._states.values():
                 state.update(phase="idle", turn=0, wave=self.wave, done=0, error="")
 
-    def begin_round(self, worker: int, turn: int, wave: int | None = None) -> None:
+    def begin_round(
+        self,
+        worker: int,
+        turn: int,
+        wave: int | None = None,
+        game: str = "",
+    ) -> None:
         self.update(
             worker,
             phase="wait",
             turn=int(turn),
             wave=int(wave or self.wave),
+            game=game or "",
             out_tokens=0,
             tok_s=0.0,
             error="",
@@ -243,6 +277,17 @@ class WorkerBoard:
             text=str(result.get("text") or ""),
             started=None,
         )
+        with self._lock:
+            self.finished.append(
+                {
+                    "worker": worker,
+                    "wave": int(wave or turn),
+                    "turn": int(turn),
+                    "input_tokens": inp,
+                    "cached_tokens": cached,
+                    "cache_reported": True,
+                }
+            )
 
     def update(self, worker: int, **fields) -> None:
         worker = max(int(worker), 1)
@@ -263,6 +308,7 @@ class WorkerBoard:
                     "cached_tokens": 0,
                     "cache_percent": None,
                     "text": "",
+                    "game": "",
                 }
             self._states[worker].update(fields)
 
@@ -393,6 +439,11 @@ class WorkerBoard:
     def compact_cells(self) -> list[str]:
         return self.worker_lines()
 
+    def warm_cache_label(self) -> str:
+        with self._lock:
+            rows = list(self.finished)
+        return aggregate_cache_percent(rows, skip_first=True).strip()
+
     def worker_lines(self) -> list[str]:
         now = time.perf_counter()
         with self._lock:
@@ -411,10 +462,12 @@ class WorkerBoard:
             elapsed = (now - started) if started else 0.0
             err = (state.get("error") or "").strip()
             name = worker_label(worker)
+            game = (state.get("game") or "").strip()
             cache_bit = _round_cache_label(state, turn)
             inp = int(state.get("input_tokens") or 0)
-            lines.append(f"{name}")
-            prefix = f"  └─ 第 {wave}/{waves} 次"
+            lines.append(f"{name}  《{game}》" if game else name)
+            phase_name = "预热" if wave <= 1 else "缓存"
+            prefix = f"  └─ {phase_name} {wave}/{waves}"
             if phase == "stream":
                 first = f" · 首字 {ttft / 1000:.1f}s" if ttft is not None else ""
                 lines.append(
@@ -433,19 +486,21 @@ class WorkerBoard:
                 lines.append(f"{prefix}  [结束]  {io_bit}{cache_bit}")
             else:
                 lines.append(f"{prefix}  [待命]")
-            for row in _output_tail(str(state.get("text") or "")):
+            for row in _output_tail(
+                str(state.get("text") or ""), n=int(getattr(self, "tail_lines", OUTPUT_TAIL_LINES))
+            ):
                 lines.append(f"     {row}")
         return lines
 
 
 def _output_tail(text: str, n: int = OUTPUT_TAIL_LINES) -> list[str]:
+    n = int(n)
+    if n <= 0:
+        return []
     rows = [row[:OUTPUT_TAIL_WIDTH] for row in (text or "").replace("\r", "").split("\n") if row]
-    tail = rows[-n:] if rows else []
-    if not tail:
-        tail = ["(还没出字)"]
-    while len(tail) < n:
-        tail.append("")
-    return tail[:n]
+    if not rows:
+        return ["(还没出字)"]
+    return rows[-n:]
 
 
 class LiveFooter:
@@ -510,8 +565,15 @@ class LiveFooter:
             first = "都还没出第一个字"
         else:
             first = f"平均 {ttft / 1000:.1f} 秒才出第一个字"
+        wave = max(int(self.board.wave), 1)
+        total = max(int(self.board.waves), 1)
+        if wave <= 1:
+            stage = f"【预热 第{wave}/{total}次 · 冷启动不计命中率】"
+        else:
+            warm = self.board.warm_cache_label()
+            stage = f"【缓存 第{wave}/{total}次 · 第2次起命中 {warm}】"
         live_line = (
-            f"⏱ {snap.elapsed:.0f}s  inflight={snap.in_flight}/{limit}  "
+            f"⏱ {snap.elapsed:.0f}s  {stage}  inflight={snap.in_flight}/{limit}  "
             f"ok={snap.ok} fail={snap.fail} 429={snap.rate_limited}  "
             f"wait={live['waiting']} stream={live['streaming']}  "
             f"out={live['out_tokens']}  {live['tok_s']:.1f} tok/s  {first}"
@@ -601,7 +663,12 @@ def print_model_average(rows: list[dict], *, show_cache: bool = True) -> None:
         f"  E2E={format_ms(average([r['e2e_ms'] for r in rows])).strip()}"
     )
     if show_cache:
-        print(f"   cache 命中 (avg): {aggregate_cache_percent(rows)}")
+        cold = [row for row in rows if is_first_request(row)]
+        print(
+            f"   cache 第1次(冷)={aggregate_cache_percent(cold).strip()}  "
+            f"第2次起={aggregate_cache_percent(rows, skip_first=True).strip()}  "
+            f"（第1次不计入命中率）"
+        )
 
 
 def print_token_totals(rows: list[dict], *, show_cache: bool = True) -> None:
@@ -639,7 +706,7 @@ def print_summary(
             cache_cols = (
                 f"{int(average([r['cached_tokens'] for r in rows])):>9}"
                 f"{int(average([r['output_tokens'] for r in rows])):>7}"
-                f"{aggregate_cache_percent(rows):>9}"
+                f"{aggregate_cache_percent(rows, skip_first=True):>9}"
                 if show_cache else
                 f"{int(average([r['output_tokens'] for r in rows])):>7}"
             )
@@ -661,6 +728,7 @@ def print_stress_summary(
     *,
     limit: int | None = None,
     show_cache: bool = True,
+    rows: list[dict] | None = None,
 ) -> None:
     separator()
     limit_text = f"  limit={limit}" if limit is not None else ""
@@ -683,7 +751,13 @@ def print_stress_summary(
         f"   TPM分项  input={snapshot.tpm_in:.0f}  output={snapshot.tpm_out:.0f}"
     )
     if show_cache:
-        tpm_line += f"  cache={snapshot.cache_percent:.1f}%"
+        if rows:
+            tpm_line += (
+                f"  cache第2次起={aggregate_cache_percent(rows, skip_first=True).strip()}"
+                f"  (第1次冷启不计入)"
+            )
+        else:
+            tpm_line += f"  cache={snapshot.cache_percent:.1f}%"
     print(tpm_line)
     token_line = (
         f"   tokens  input={snapshot.input_tokens}  output={snapshot.output_tokens}"
@@ -741,6 +815,9 @@ def write_report(
             )
             lines.append("")
         ttfts = [r["ttft_ms"] for r in rows]
+        if show_cache:
+            lines.append("cache% 只计第 2 次起（第 1 次冷启动不计入）。")
+            lines.append("")
         lines.append("| 范围 | TTFT avg | TTFT p95 | tok/s | cache% | input | output |")
         lines.append("|------|----------|----------|-------|--------|-------|--------|")
         lines.append(
@@ -748,7 +825,7 @@ def write_report(
             f" {_md(average(ttfts))} |"
             f" {_md(_p95(ttfts))} |"
             f" {_md(average_or_none([r.get('output_tps') for r in rows]))} |"
-            f" {aggregate_cache_percent(rows).strip() if show_cache else '-'} |"
+            f" {aggregate_cache_percent(rows, skip_first=True).strip() if show_cache else '-'} |"
             f" {sum(r['input_tokens'] for r in rows)} |"
             f" {sum(r['output_tokens'] for r in rows)} |"
         )
@@ -763,7 +840,7 @@ def write_report(
                 f" {_md(average(w_ttft))} |"
                 f" {_md(_p95(w_ttft))} |"
                 f" {_md(average_or_none([r.get('output_tps') for r in group]))} |"
-                f" {aggregate_cache_percent(group).strip() if show_cache else '-'} |"
+                f" {aggregate_cache_percent(group, skip_first=True).strip() if show_cache else '-'} |"
                 f" {sum(r['input_tokens'] for r in group)} |"
                 f" {sum(r['output_tokens'] for r in group)} |"
             )
