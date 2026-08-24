@@ -10,6 +10,7 @@ from llm_bench.prompts import (
     DEFAULT_SYSTEM,
     compose_system,
     compose_user,
+    estimate_tokens,
     pad_to_tokens,
     plan_request,
 )
@@ -111,6 +112,14 @@ class ConversationTest(unittest.TestCase):
         self.assertNotEqual(first, other)
         self.assertIn("BASE", first)
         self.assertIn("CONTEXT PADDING", first)
+        self.assertLessEqual(estimate_tokens(first), 8000)
+
+    def test_game_prefix_leaves_room_for_user_message(self):
+        from llm_bench.prompts import game_prefix
+
+        text = game_prefix(1, "", 8000, "salt")
+        self.assertLessEqual(estimate_tokens(text), 8000)
+        self.assertIn("潮汐港务", text)
 
     def test_pad_blocks_carry_the_named_game(self):
         text = pad_to_tokens(

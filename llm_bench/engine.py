@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from .config import PROJECT_DIR
 from .conversation import Conversation
 from .prompts import CONTEXT_WINDOW, estimate_tokens, game_prefix, pick_game
-from .reporting import LiveFooter, OutputLog, WorkerBoard, live_tail_lines
+from .reporting import LiveFooter, OutputLog, WorkerBoard
 from .stress import AdaptiveGate, StressStats
 from .transport import HttpStatusError, call_with_retries
 
@@ -268,7 +268,6 @@ def run_pool(
     gate = AdaptiveGate(workers)
     stop = threading.Event()
     board = WorkerBoard(workers, waves=rounds, show_cache=cache)
-    board.tail_lines = live_tail_lines(workers, header_lines=len(header or []) + 4)
     worker_prefixes = [""] * workers
     worker_tokens = [0] * workers
     if pad and max_input > 0:

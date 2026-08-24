@@ -6,6 +6,7 @@ import shutil
 import sys
 import threading
 import time
+import unicodedata
 from typing import Optional
 
 
@@ -109,20 +110,54 @@ OUTPUT_TAIL_LINES = 4
 OUTPUT_TAIL_WIDTH = 86
 
 
-def live_tail_lines(workers: int, header_lines: int = 18) -> int:
-    """按终端高度给每个 work 分尾部行数；至少留 1 行模型输出。"""
-    workers = max(int(workers), 1)
+def terminal_size() -> tuple[int, int]:
+    """当前终端列数、行数。给不出时用 80×40。"""
     try:
-        rows = int(shutil.get_terminal_size(fallback=(80, 40)).lines)
+        size = shutil.get_terminal_size(fallback=(80, 40))
+        cols, rows = int(size.columns), int(size.lines)
     except Exception:
-        rows = 40
-    remaining = max(int(rows) - int(header_lines) - 2, 0)
+        cols, rows = 80, 40
+    return max(cols, 20), max(rows, 8)
+
+
+def display_width(text: str) -> int:
+    width = 0
+    for char in text or "":
+        if char in "\n\r":
+            continue
+        width += 2 if unicodedata.east_asian_width(char) in {"F", "W"} else 1
+    return width
+
+
+def fit_line(text: str, width: int) -> str:
+    """按显示宽度截断，避免中文把一行折成两行顶出屏幕。"""
+    text = (text or "").replace("\r", "").replace("\n", " ")
+    width = max(int(width), 1)
+    if display_width(text) <= width:
+        return text
+    if width <= 1:
+        return "…"[:width]
+    limit = width - 1
+    out: list[str] = []
+    used = 0
+    for char in text:
+        extra = 2 if unicodedata.east_asian_width(char) in {"F", "W"} else 1
+        if used + extra > limit:
+            break
+        out.append(char)
+        used += extra
+    return "".join(out) + "…"
+
+
+def live_tail_lines(workers: int, header_lines: int = 18) -> int:
+    """还能给每个 work 分几行尾巴。不够就 0，改走单行/网格，不要顶出屏幕。"""
+    workers = max(int(workers), 1)
+    _, rows = terminal_size()
+    remaining = max(rows - int(header_lines) - 2, 0)
     per = remaining // workers - 2
     if per >= OUTPUT_TAIL_LINES:
         return OUTPUT_TAIL_LINES
-    if per >= 1:
-        return per
-    return 1
+    return max(0, per)
 
 
 class OutputLog:
@@ -408,74 +443,206 @@ class WorkerBoard:
             rows = list(self.finished)
         return aggregate_cache_percent(rows, skip_first=True).strip()
 
-    def worker_lines(self) -> list[str]:
+    def _snapshots(self) -> list[dict]:
         now = time.perf_counter()
         with self._lock:
             items = sorted(self._states.items())
             first_by_worker = first_success_by_worker(self.finished)
-        lines = []
-        waves = self.waves
         show_cache = bool(getattr(self, "show_cache", True))
+        waves = self.waves
+        snaps = []
         for worker, state in items:
             phase = state.get("phase") or "idle"
             turn = max(int(state.get("turn") or 0), 1)
             wave = max(int(state.get("wave") or self.wave or 1), 1)
-            done = int(state.get("done") or 0)
-            out_tokens = int(state.get("out_tokens") or 0)
-            tok_s = float(state.get("tok_s") or 0.0)
-            ttft = state.get("ttft_ms")
-            started = state.get("started")
-            elapsed = (now - started) if started else 0.0
-            err = (state.get("error") or "").strip()
-            name = worker_label(worker)
-            game = (state.get("game") or "").strip()
             first_wave = first_by_worker.get(worker)
             warmup = show_cache and (first_wave is None or first_wave == wave)
-            cache_bit = _round_cache_label(
-                state, turn, show_cache=show_cache, warmup=warmup
-            )
-            inp = int(state.get("input_tokens") or 0)
-            lines.append(f"{name}  《{game}》" if game else name)
             if not show_cache:
                 phase_name = "换新"
             elif warmup:
                 phase_name = "预热"
             else:
                 phase_name = "缓存"
-            prefix = f"  └─ {phase_name} {wave}/{waves}"
-            if phase == "stream":
-                first = f" · 首字 {ttft / 1000:.1f}s" if ttft is not None else ""
-                lines.append(
-                    f"{prefix}  [输出中]  "
-                    f"{out_tokens} tok · {tok_s:.1f}/s · {elapsed:.0f}s"
-                    f"{first}  ·  {cache_bit}"
-                )
-            elif phase == "wait":
-                lines.append(
-                    f"{prefix}  [等首字]  已等 {elapsed:.0f}s  ·  {cache_bit}"
-                )
-            elif phase == "error":
-                lines.append(f"{prefix}  [失败]  {err[:70]}")
-            elif done:
-                io_bit = f"输入 {inp} → 输出 {out_tokens}  ·  " if inp or out_tokens else ""
-                lines.append(f"{prefix}  [结束]  {io_bit}{cache_bit}")
-            else:
-                lines.append(f"{prefix}  [待命]")
-            for row in _output_tail(
-                str(state.get("text") or ""), n=int(getattr(self, "tail_lines", OUTPUT_TAIL_LINES))
-            ):
-                lines.append(f"     {row}")
-        return lines
+            started = state.get("started")
+            snaps.append(
+                {
+                    "worker": worker,
+                    "name": worker_label(worker),
+                    "game": (state.get("game") or "").strip(),
+                    "phase": phase,
+                    "turn": turn,
+                    "wave": wave,
+                    "waves": waves,
+                    "done": int(state.get("done") or 0),
+                    "out": int(state.get("out_tokens") or 0),
+                    "tok_s": float(state.get("tok_s") or 0.0),
+                    "ttft": state.get("ttft_ms"),
+                    "elapsed": (now - started) if started else 0.0,
+                    "err": (state.get("error") or "").strip(),
+                    "inp": int(state.get("input_tokens") or 0),
+                    "text": str(state.get("text") or ""),
+                    "phase_name": phase_name,
+                    "cache_bit": _round_cache_label(
+                        state, turn, show_cache=show_cache, warmup=warmup
+                    ),
+                }
+            )
+        return snaps
+
+    def worker_lines(self, *, budget: int | None = None, width: int = 80) -> list[str]:
+        snaps = self._snapshots()
+        n = max(len(snaps), 1)
+        if budget is None:
+            tail = int(getattr(self, "tail_lines", OUTPUT_TAIL_LINES))
+            budget = n * (2 + max(tail, 0))
+        budget = max(int(budget), 1)
+        width = max(int(width), 20)
+        per = budget // n
+        if per >= 3:
+            lines = _lines_detailed(snaps, min(OUTPUT_TAIL_LINES, per - 2), width)
+        elif per >= 2:
+            lines = _lines_two(snaps, width)
+        elif budget >= n:
+            lines = _lines_one(snaps, width)
+        else:
+            lines = _lines_grid(snaps, budget, width)
+        return [fit_line(line, width) for line in lines]
 
 
-def _output_tail(text: str, n: int = OUTPUT_TAIL_LINES) -> list[str]:
+def _output_tail(text: str, n: int = OUTPUT_TAIL_LINES, width: int = OUTPUT_TAIL_WIDTH) -> list[str]:
     n = int(n)
     if n <= 0:
         return []
-    rows = [row[:OUTPUT_TAIL_WIDTH] for row in (text or "").replace("\r", "").split("\n") if row]
+    width = max(int(width), 8)
+    rows = [
+        fit_line(row, width)
+        for row in (text or "").replace("\r", "").split("\n")
+        if row
+    ]
     if not rows:
-        return ["(还没出字)"]
+        return [fit_line("(还没出字)", width)]
     return rows[-n:]
+
+
+def _status_long(snap: dict) -> str:
+    phase = snap["phase"]
+    prefix = f"  └─ {snap['phase_name']} {snap['wave']}/{snap['waves']}"
+    if phase == "stream":
+        first = f" · 首字 {snap['ttft'] / 1000:.1f}s" if snap["ttft"] is not None else ""
+        return (
+            f"{prefix}  [输出中]  "
+            f"{snap['out']} tok · {snap['tok_s']:.1f}/s · {snap['elapsed']:.0f}s"
+            f"{first}  ·  {snap['cache_bit']}"
+        )
+    if phase == "wait":
+        return f"{prefix}  [等首字]  已等 {snap['elapsed']:.0f}s  ·  {snap['cache_bit']}"
+    if phase == "error":
+        return f"{prefix}  [失败]  {snap['err'][:70]}"
+    if snap["done"]:
+        io_bit = (
+            f"输入 {snap['inp']} → 输出 {snap['out']}  ·  "
+            if snap["inp"] or snap["out"]
+            else ""
+        )
+        return f"{prefix}  [结束]  {io_bit}{snap['cache_bit']}"
+    return f"{prefix}  [待命]"
+
+
+def _status_one(snap: dict) -> str:
+    game = f" 《{snap['game']}》" if snap["game"] else ""
+    phase = snap["phase"]
+    if phase == "stream":
+        body = (
+            f"输出中 {snap['wave']}/{snap['waves']} "
+            f"out={snap['out']} {snap['tok_s']:.0f}/s {snap['elapsed']:.0f}s "
+            f"{snap['cache_bit']}"
+        )
+    elif phase == "wait":
+        body = (
+            f"等首字 {snap['wave']}/{snap['waves']} "
+            f"{snap['elapsed']:.0f}s {snap['cache_bit']}"
+        )
+    elif phase == "error":
+        body = f"失败 {snap['err'][:40]}"
+    elif snap["done"]:
+        body = (
+            f"结束 {snap['wave']}/{snap['waves']} "
+            f"out={snap['out']} {snap['cache_bit']}"
+        )
+    else:
+        body = "待命"
+    return f"{snap['name']}{game}  {body}"
+
+
+def _status_cell(snap: dict) -> str:
+    phase = snap["phase"]
+    if phase == "stream":
+        bit = f"输出{snap['out']}"
+    elif phase == "wait":
+        bit = f"等{snap['elapsed']:.0f}s"
+    elif phase == "error":
+        bit = "失败"
+    elif snap["done"]:
+        bit = "完成"
+    else:
+        bit = "待命"
+    return f"{snap['name']} {bit}"
+
+
+def _lines_detailed(snaps: list[dict], tail: int, width: int) -> list[str]:
+    tail_width = max(width - 5, 8)
+    lines = []
+    for snap in snaps:
+        title = f"{snap['name']}  《{snap['game']}》" if snap["game"] else snap["name"]
+        lines.append(fit_line(title, width))
+        lines.append(fit_line(_status_long(snap), width))
+        for row in _output_tail(snap["text"], n=tail, width=tail_width):
+            lines.append(fit_line(f"     {row}", width))
+    return lines
+
+
+def _lines_two(snaps: list[dict], width: int) -> list[str]:
+    tail_width = max(width - 5, 8)
+    lines = []
+    for snap in snaps:
+        lines.append(fit_line(_status_one(snap), width))
+        tail = _output_tail(snap["text"], n=1, width=tail_width)
+        lines.append(fit_line(f"     {tail[0]}" if tail else "     ", width))
+    return lines
+
+
+def _lines_one(snaps: list[dict], width: int) -> list[str]:
+    return [fit_line(_status_one(snap), width) for snap in snaps]
+
+
+def _lines_grid(snaps: list[dict], budget: int, width: int) -> list[str]:
+    n = len(snaps)
+    budget = max(int(budget), 1)
+    cell_min = 16
+    sep = 3
+    ncols = max(1, min(n, (width + sep) // (cell_min + sep)))
+    capacity = ncols * budget
+    extra = n > capacity
+    show = snaps[: capacity - 1] if extra else snaps
+    cell_w = max(1, (width - (ncols - 1) * sep) // ncols)
+    cells = [fit_line(_status_cell(snap), cell_w) for snap in show]
+    if extra:
+        cells.append(fit_line(f"+{n - len(show)}路", cell_w))
+    rows = []
+    for i in range(0, len(cells), ncols):
+        rows.append(fit_line(" | ".join(cells[i:i + ncols]), width))
+    return rows[:budget]
+
+
+def _shrink_header(header: list[str]) -> list[str]:
+    if not header:
+        return []
+    title = next((line for line in header if "LLM Bench" in line), header[0])
+    play = next((line for line in header if line.startswith("▶")), "")
+    out = [title]
+    if play and play != title:
+        out.append(play)
+    return out
 
 
 class LiveFooter:
@@ -537,12 +704,21 @@ class LiveFooter:
     def _draw(self) -> None:
         if not self._tty:
             return
+        cols, rows = terminal_size()
+        lines = [
+            fit_line(line, cols) for line in self._compose(cols=cols, rows=rows)[:rows]
+        ]
         sys.stdout.write("\033[H\033[J")
-        sys.stdout.write("\n".join(self._compose()) + "\n")
+        if lines:
+            # 最后一行不要再加换行，否则刚好写满屏幕时会把整页顶上去。
+            sys.stdout.write("\n".join(lines))
         sys.stdout.flush()
         self._n = 0
 
-    def _compose(self) -> list[str]:
+    def _compose(self, cols: int | None = None, rows: int | None = None) -> list[str]:
+        tcols, trows = terminal_size()
+        cols = max(int(cols or tcols), 20)
+        rows = max(int(rows or trows), 8)
         snap = self.stats.snapshot()
         live = self.board.live_totals()
         limit = self.gate.limit if self.gate is not None else snap.workers
@@ -566,12 +742,30 @@ class LiveFooter:
             f"wait={live['waiting']} stream={live['streaming']}  "
             f"out={live['out_tokens']}  {live['tok_s']:.1f} tok/s  {first}"
         )
-        lines = []
-        if self.header:
-            lines.extend(self.header)
+        workers = max(int(self.board.workers), 1)
+        full_header = list(self.header)
+        short_header = _shrink_header(full_header)
+
+        def overhead(header: list[str]) -> int:
+            return len(header) + (1 if header else 0) + 2
+
+        header = full_header
+        if overhead(full_header) + workers > rows:
+            header = short_header
+        remain = max(rows - overhead(header), 1)
+        sep = "─" * min(88, cols)
+        lines: list[str] = []
+        if header:
+            lines.extend(fit_line(line, cols) for line in header)
             lines.append("")
-        lines.extend([live_line, "─" * 88, *self.board.worker_lines()])
-        return lines
+        lines.extend(
+            [
+                fit_line(live_line, cols),
+                fit_line(sep, cols),
+                *self.board.worker_lines(budget=remain, width=cols),
+            ]
+        )
+        return lines[:rows]
 
 
 def print_model_average(rows: list[dict], *, show_cache: bool = True) -> None:

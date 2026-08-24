@@ -144,7 +144,7 @@ class StressStatsTest(unittest.TestCase):
         board.update(2, phase="wait", turn=1, wave=1, out_tokens=0, started=0.0)
         footer = LiveFooter(stats=stats, board=board)
         footer._tty = False
-        lines = footer._compose()
+        lines = footer._compose(cols=80, rows=40)
         joined = "\n".join(lines)
         self.assertIn("work1", joined)
         self.assertIn("缓存", joined)
@@ -175,7 +175,7 @@ class StressStatsTest(unittest.TestCase):
         )
         footer = LiveFooter(stats=stats, board=board, show_cache=False)
         footer._tty = False
-        joined = "\n".join(footer._compose())
+        joined = "\n".join(footer._compose(cols=80, rows=40))
         self.assertNotIn("预热", joined)
         self.assertNotIn("【缓存", joined)
         self.assertIn("换新", joined)
@@ -196,13 +196,17 @@ class StressStatsTest(unittest.TestCase):
         )
         footer._tty = True
         buf = StringIO()
-        with patch("sys.stdout", buf):
+        size = __import__("os").terminal_size((80, 40))
+        with patch("sys.stdout", buf), patch(
+            "llm_bench.reporting.shutil.get_terminal_size", return_value=size
+        ):
             footer.refresh()
         out = buf.getvalue()
         self.assertTrue(out.startswith("\033[H\033[J"))
         self.assertIn("LLM Bench · 不要缓存  workers=10（一波全量线程）", out)
         self.assertEqual(out.count("work1"), 1)
         self.assertNotIn("快捷键", out)
+        self.assertFalse(out.endswith("\n"))
 
     def test_live_tail_lines_shrinks_for_many_workers(self):
         import os
@@ -213,7 +217,81 @@ class StressStatsTest(unittest.TestCase):
         size = os.terminal_size((80, 24))
         with patch("llm_bench.reporting.shutil.get_terminal_size", return_value=size):
             self.assertEqual(live_tail_lines(1, header_lines=5), 4)
-            self.assertEqual(live_tail_lines(10, header_lines=18), 1)
+            self.assertEqual(live_tail_lines(10, header_lines=18), 0)
+
+    def test_compose_fits_small_terminal_with_many_workers(self):
+        from llm_bench.reporting import LiveFooter, WorkerBoard, display_width
+
+        stats = StressStats(workers=40, window=15, now=Clock())
+        board = WorkerBoard(40, waves=2)
+        board.wave = 1
+        for i in range(1, 41):
+            board.update(
+                i,
+                phase="stream",
+                turn=1,
+                wave=1,
+                game="潮汐港务",
+                out_tokens=120,
+                tok_s=40,
+                started=0.0,
+                text="很长的模型输出 " * 20,
+            )
+        header = [
+            "═" * 88,
+            "LLM Bench · 要缓存  workers=40（一波全量线程）  rounds=2",
+            "   chat      : http://127.0.0.1:8080",
+            "   responses : http://127.0.0.1:8080",
+            "   messages  : http://127.0.0.1:8080",
+            "   models    : grok-4.6",
+            "   formats   : responses",
+            "   session   : sticky",
+            "   cache     : hit",
+            "   retries   : 2",
+            "   window    : context=500000",
+            "   prefix    : padded",
+            "   prompt    : games",
+            "═" * 88,
+            "▶ responses  http://127.0.0.1:8080/v1/responses  model=grok-4.6",
+        ]
+        footer = LiveFooter(stats=stats, board=board, header=header)
+        footer._tty = False
+        lines = footer._compose(cols=80, rows=24)
+        self.assertLessEqual(len(lines), 24)
+        self.assertTrue(any("LLM Bench" in line for line in lines))
+        self.assertRegex("\n".join(lines), r"(?<![\d])work1(?!\d)")
+        for line in lines:
+            self.assertLessEqual(display_width(line), 80)
+
+    def test_draw_does_not_write_past_terminal(self):
+        from io import StringIO
+        from unittest.mock import patch
+        import os
+
+        from llm_bench.reporting import LiveFooter, WorkerBoard, display_width
+
+        stats = StressStats(workers=30, window=15, now=Clock())
+        board = WorkerBoard(30, waves=2)
+        for i in range(1, 31):
+            board.update(i, phase="wait", turn=1, wave=1, game="夜市烟火", started=0.0)
+        footer = LiveFooter(
+            stats=stats,
+            board=board,
+            header=["═" * 88, "LLM Bench · 不要缓存  workers=30（一波全量线程）"],
+        )
+        footer._tty = True
+        buf = StringIO()
+        size = os.terminal_size((60, 20))
+        with patch("sys.stdout", buf), patch(
+            "llm_bench.reporting.shutil.get_terminal_size", return_value=size
+        ):
+            footer.refresh()
+        body = buf.getvalue().split("\033[H\033[J", 1)[-1]
+        rows = body.split("\n")
+        self.assertLessEqual(len(rows), 20)
+        for row in rows:
+            self.assertLessEqual(display_width(row), 60)
+        self.assertFalse(body.endswith("\n"))
 
     def test_output_log_is_silent_and_writes_file(self):
         import tempfile

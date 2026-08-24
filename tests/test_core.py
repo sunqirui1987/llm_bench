@@ -285,9 +285,26 @@ class CoreTest(unittest.TestCase):
         self.assertIn("text", live)
 
     def test_pad_to_tokens_reaches_target(self):
-        padded = pad_to_tokens("hello", 300, salt="bench")
         from llm_bench.prompts import estimate_tokens
-        self.assertGreaterEqual(estimate_tokens(padded), 300)
+
+        padded = pad_to_tokens("hello", 300, salt="bench")
+        est = estimate_tokens(padded)
+        self.assertGreater(est, 200)
+        self.assertLessEqual(est, 300)
+
+    def test_window_overhead_matches_gateway_budget(self):
+        from llm_bench.prompts import (
+            CONTEXT_WINDOW,
+            DEFAULT_OUTPUT_RESERVE,
+            _window_overhead,
+            fit_max_input,
+        )
+
+        overhead = _window_overhead(CONTEXT_WINDOW)
+        self.assertGreaterEqual(overhead, 24_000)
+        cap = fit_max_input(CONTEXT_WINDOW, CONTEXT_WINDOW, CONTEXT_WINDOW)
+        self.assertLessEqual(cap + DEFAULT_OUTPUT_RESERVE + overhead, CONTEXT_WINDOW)
+        self.assertLessEqual(cap, 475_424)
 
 
 if __name__ == "__main__":

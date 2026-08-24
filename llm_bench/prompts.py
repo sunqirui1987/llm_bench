@@ -12,8 +12,22 @@ from .games import GAMES, pick_game
 CONTEXT_WINDOW = 500_000
 TOKEN_OVERHEAD = 2_048
 DEFAULT_OUTPUT_RESERVE = 65_536
-TARGET_INPUT_TOKENS = CONTEXT_WINDOW - DEFAULT_OUTPUT_RESERVE - TOKEN_OVERHEAD
+# 网关实测 500k 窗只给当前消息约 475k，再扣 user/roles/CACHE_BYPASS。
+INPUT_FRAME_RESERVE = 2_048
 UNIQUE_PREFIX_LINES = 16
+
+
+def _window_overhead(context_window: int) -> int:
+    """给网关采样预算留空。500k 窗大约要 5%（实测预算 475424）。"""
+    window = max(int(context_window), 1)
+    percent = max(window // 20, 1)
+    floor = min(TOKEN_OVERHEAD, max(window // 4, 1))
+    return max(percent, floor)
+
+
+TARGET_INPUT_TOKENS = (
+    CONTEXT_WINDOW - DEFAULT_OUTPUT_RESERVE - _window_overhead(CONTEXT_WINDOW)
+)
 
 DEFAULT_SYSTEM = (
     "你是《宿命旅途》的场景主持人。只用这份档案里的专属设定："
@@ -63,7 +77,7 @@ _PAD_BLOCKS = (
 
 
 def estimate_tokens(text: str) -> int:
-    """粗估 token：汉字略大于 1，其它按 4 字符 1 token。"""
+    """粗估 token。宁多勿少：Grok 对这份中文填充大约比 1.15 贵 11%，低估会 413。"""
     if not text:
         return 0
     cjk = 0
@@ -82,7 +96,7 @@ def estimate_tokens(text: str) -> int:
             continue
         else:
             other += 1
-    return int(cjk * 1.15 + other / 4)
+    return max(int(cjk * 1.4 + other / 3.5), 1)
 
 
 def read_text_file(path: str, *, label: str = "file") -> str:
@@ -125,11 +139,6 @@ def game_bible() -> str:
 
 def worker_domain(worker_id: int) -> str:
     return pick_game(worker_id)["title"]
-
-
-def _window_overhead(context_window: int) -> int:
-    window = max(int(context_window), 1)
-    return min(TOKEN_OVERHEAD, max(window // 20, 1))
 
 
 def clamp_output_tokens(input_tokens: int, max_tokens: int, context_window: int) -> int:
@@ -200,14 +209,21 @@ def pad_to_tokens(
         max(estimate_tokens(render(slot)), 1) for slot in range(len(_PAD_BLOCKS))
     ]
     index = 0
-    while current < target:
+    while True:
         slot = index % len(_PAD_BLOCKS)
+        nxt = block_tokens[slot]
+        if current >= target or current + nxt > target:
+            break
         parts.append(render(index))
-        current += block_tokens[slot]
+        current += nxt
         index += 1
         if index > 1_000_000:
             break
-    return "".join(parts)
+    text = "".join(parts)
+    while len(parts) > 2 and estimate_tokens(text) > target:
+        parts.pop()
+        text = "".join(parts)
+    return text
 
 
 def compose_system(
@@ -250,9 +266,10 @@ def game_prefix(worker_id: int, base_system: str, max_input: int, salt: str) -> 
         bible = game_bible()
         if bible:
             body = bible + body
+    target = max(int(max_input) - INPUT_FRAME_RESERVE, 1)
     return pad_to_tokens(
         body,
-        max_input,
+        target,
         salt=salt,
         domain=game["title"],
         genre=game["genre"],
