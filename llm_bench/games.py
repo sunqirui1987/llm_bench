@@ -141,4 +141,5 @@ GAMES = (
 
 
 def pick_game(worker_id: int) -> dict:
+    """work1 起按目录轮转；超过 16 路会循环复用同一款游戏。"""
     return GAMES[int(worker_id) % len(GAMES)]

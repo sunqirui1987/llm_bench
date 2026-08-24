@@ -1,4 +1,4 @@
-"""压测语料：5 步把输入抬到上限，用户任务按 worker/步骤换题。"""
+"""压测语料：按 worker 选游戏，把输入填到上限。"""
 
 from __future__ import annotations
 
@@ -13,8 +13,6 @@ CONTEXT_WINDOW = 500_000
 TOKEN_OVERHEAD = 2_048
 DEFAULT_OUTPUT_RESERVE = 65_536
 TARGET_INPUT_TOKENS = CONTEXT_WINDOW - DEFAULT_OUTPUT_RESERVE - TOKEN_OVERHEAD
-HISTORY_TOKEN_BUDGET = 420_000
-ASSISTANT_KEEP_CHARS = 12_000
 UNIQUE_PREFIX_LINES = 16
 
 DEFAULT_SYSTEM = (
@@ -35,10 +33,6 @@ DEFAULT_USER = (
     "首通只奖一次，写入 clearedStages。\n"
     "过程里要用到的字段：currentStageId、clearedStages、battleMode、roster、team、"
     "initialHeroId、firstLoginTime。"
-)
-
-DEFAULT_FOLLOWUP = (
-    "从刚才停下的地方继续写这一场，不要重开，不要重复。写到输出上限。"
 )
 
 WORKER_DOMAINS = tuple(game["title"] for game in GAMES)
@@ -161,18 +155,6 @@ def plan_request(
     inp = fit_max_input(max_input, max_tokens, context_window)
     out = clamp_output_tokens(inp, max_tokens, context_window)
     return {"input_tokens": inp, "max_tokens": out}
-
-
-def slice_to_tokens(text: str, target: int) -> str:
-    """按字符比例切前缀，保证 step k 是 step k+1 的字节前缀。"""
-    if not text:
-        return ""
-    target = max(int(target), 1)
-    total = estimate_tokens(text)
-    if total <= target:
-        return text
-    n = max(1, int(len(text) * target / total))
-    return text[:n]
 
 
 def pad_to_tokens(
@@ -318,30 +300,3 @@ def build_miss_user(
     if extra:
         parts.append(extra)
     return "\n".join(parts)
-
-
-def build_followup_prompt(turn: int, template: str = "") -> str:
-    body = (template or DEFAULT_FOLLOWUP).strip() or DEFAULT_FOLLOWUP
-    return f"CONTINUE_TURN {turn}\n{body}"
-
-
-def clip_text(text: str, limit: int = ASSISTANT_KEEP_CHARS) -> str:
-    text = text or ""
-    if len(text) <= limit:
-        return text
-    keep = max(limit // 2, 256)
-    return text[:keep] + "\n…(truncated so this conversation can continue)…\n" + text[-keep:]
-
-
-def estimate_messages_tokens(messages: list[dict]) -> int:
-    return sum(estimate_tokens(str(item.get("content") or "")) + 8 for item in messages)
-
-
-def trim_messages(messages: list[dict], budget: int = HISTORY_TOKEN_BUDGET) -> list[dict]:
-    """保住 system 和当前待发送的最后一条 user，丢掉最早的已完成回合。"""
-    while len(messages) > 3 and estimate_messages_tokens(messages) > budget:
-        if messages[1].get("role") == "user" and messages[2].get("role") == "assistant":
-            del messages[1:3]
-        else:
-            del messages[1]
-    return messages

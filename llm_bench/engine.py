@@ -267,7 +267,7 @@ def run_pool(
     stats = StressStats(workers=workers)
     gate = AdaptiveGate(workers)
     stop = threading.Event()
-    board = WorkerBoard(workers, waves=rounds)
+    board = WorkerBoard(workers, waves=rounds, show_cache=cache)
     board.tail_lines = live_tail_lines(workers, header_lines=len(header or []) + 4)
     worker_prefixes = [""] * workers
     worker_tokens = [0] * workers
@@ -282,7 +282,9 @@ def run_pool(
             worker_prefixes[wid] = game_prefix(wid, system, max_input, salt)
             worker_tokens[wid] = estimate_tokens(worker_prefixes[wid])
     output_log = OutputLog(log_dir=PROJECT_DIR / "logs")
-    footer = LiveFooter(stats=stats, board=board, gate=gate, header=header)
+    footer = LiveFooter(
+        stats=stats, board=board, gate=gate, header=header, show_cache=cache
+    )
     footer.start()
     rows: list[dict] = []
     deadline = time.monotonic() + duration if duration > 0 else None

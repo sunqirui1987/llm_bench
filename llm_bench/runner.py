@@ -21,11 +21,11 @@ from .config import (
     resolve_base_urls,
 )
 from .engine import run_pool, turn_request as _turn_request
+from .games import GAMES
 from .prompts import (
     CONTEXT_WINDOW,
     compose_system,
     compose_user,
-    estimate_tokens,
     fit_max_input,
     plan_request,
 )
@@ -116,21 +116,19 @@ def _print_start(
     retries: int,
     retry_delay: float,
     timeout: int,
-    system: str,
-    system_text: str,
     prompt: str,
-    max_tokens: int,
     max_input: int,
     context_window: int,
     plan: dict,
     pad: bool,
     custom_prompt: bool,
+    custom_system: bool,
 ) -> list[str]:
     total = workers * max(int(rounds), 0)
     if hit_cache:
         title = "LLM Bench · 要缓存"
         session_desc = f"每路钉死一条 session（示例 {initial_session}）"
-        cache_flow = "第1次预热（冷启动，不计命中率）；第2次起同一条命令再发，测 cache"
+        cache_flow = "每路第一次成功为预热（不计命中率）；之后同一条命令再发，测 cache"
     else:
         title = "LLM Bench · 不要缓存"
         session_desc = "不带 session"
@@ -164,9 +162,16 @@ def _print_start(
     lines.append(
         f"   prefix    : {'按每路游戏填到 '+str(plan['input_tokens'])+' token' if pad else '短指令，不填充'}"
     )
+    n_games = len(GAMES)
+    if workers > n_games:
+        lines.append(
+            f"   games     : {n_games} 款游戏循环复用（work{n_games + 1} 与 work1 同一款）"
+        )
+    if custom_system:
+        lines.append("   system    : 自定义系统提示（所有 work 共用，叠在各自游戏设定上）")
     if custom_prompt:
         lines.append(
-            f"   prompt    : 自定义（覆盖所有 work） {prompt[:50]}{'...' if len(prompt) > 50 else ''}"
+            f"   prompt    : 自定义（覆盖所有 work 的用户命令） {prompt[:50]}{'...' if len(prompt) > 50 else ''}"
         )
     else:
         lines.append("   prompt    : 每路一款游戏自己的开场命令（games.py）")
@@ -205,17 +210,19 @@ def bench(
     timeout: int = 7200,
     workers: int = DEFAULT_WORKERS,
     duration: float = 0.0,
-    report_every: float = 5.0,
-    verbose: bool = False,
     cache_mode: str = "hit",
 ):
     """workers 路同时发命令。
 
-    --cache_mode hit   同一条命令原样再发，粘 session。第 1 次冷，第 2 次起命中。
-    --cache_mode miss  每一次都换新命令，不带 session。
-    --rounds           全量线程把这条命令再发几遍。
+    --cache_mode hit   同一条命令原样再发，粘 session。每路第一次成功为冷启动，不计命中率。
+    --cache_mode miss  每一次都换新命令，不带 session。界面不标预热/缓存。
+    --rounds           全量线程把这条命令再发几遍（默认 2：一次冷、一次热）。
+    --prompt/--prompt_file
+                       覆盖所有 work 的用户命令。不传则每路用自己那款游戏的开场。
+    --system           long=按游戏填充到 --input_tokens；short=短系统提示，不填充。
+    --system_prompt/--system_file
+                       叠在每路游戏设定上，所有 work 共用这段。
     """
-    del report_every, verbose
     models, formats, base_urls, api_key, initial_session = _prepare(
         models,
         formats,
@@ -240,6 +247,9 @@ def bench(
     custom_prompt = bool(str(prompt_file or "").strip()) or (
         bool((prompt or "").strip())
         and (prompt or "").strip() != (DEFAULT_PROMPT or "").strip()
+    )
+    custom_system = bool(str(system_file or "").strip()) or bool(
+        (system_prompt or "").strip()
     )
     system_text, prompt, followup_text = _build_prompts(
         system="short",
@@ -270,15 +280,13 @@ def bench(
         retries=retries,
         retry_delay=retry_delay,
         timeout=timeout,
-        system=system,
-        system_text=system_text,
         prompt=prompt,
-        max_tokens=max_tokens,
         max_input=max_input,
         context_window=context_window,
         plan=plan,
         pad=pad,
         custom_prompt=custom_prompt,
+        custom_system=custom_system,
     )
 
     summary: dict = {}

@@ -4,10 +4,12 @@
 
 没有 step。每一波，每个 worker 只发 **一条命令**。
 
-- `--cache_mode hit`：每个 worker 一款不同的游戏，**同一条命令原样再发**。粘 session。第 1 次冷启，第 2 次起应对上 cache。
-- `--cache_mode miss`：仍是每人一款游戏，但每一次换新场面、换新盐，不带 session。
+- `--cache_mode hit`：每个 worker 一款不同的游戏，**同一条命令原样再发**。粘 session。每路第一次成功是冷启动，不计命中率。
+- `--cache_mode miss`：仍是每人一款游戏，但每一次换新场面、换新盐，不带 session。界面不标预热/缓存。
 
 `--rounds`：全量线程把命令再发几遍。hit 时就是「同样的命令再来」；miss 时每一遍都不同。
+
+内置 16 款游戏（`llm_bench/games.py`）。`--workers` 超过 16 会循环复用。`--prompt` / `--prompt_file` 会覆盖**所有** work 的用户命令，不再按游戏开场。`--system_prompt` / `--system_file` 叠在每路游戏设定上，所有 work 共用。
 
 ## 配置
 

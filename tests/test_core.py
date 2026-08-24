@@ -98,11 +98,42 @@ class CoreTest(unittest.TestCase):
             aggregate_cache_percent(rows, skip_first=True).strip(), "100.0%"
         )
 
+    def test_aggregate_cache_skips_each_workers_first_success(self):
+        rows = [
+            {
+                "worker": 1,
+                "wave": 2,
+                "input_tokens": 1000,
+                "cached_tokens": 0,
+                "cache_reported": True,
+            },
+            {
+                "worker": 2,
+                "wave": 1,
+                "input_tokens": 1000,
+                "cached_tokens": 0,
+                "cache_reported": True,
+            },
+            {
+                "worker": 2,
+                "wave": 2,
+                "input_tokens": 1000,
+                "cached_tokens": 1000,
+                "cache_reported": True,
+            },
+        ]
+        self.assertEqual(
+            aggregate_cache_percent(rows, skip_first=True).strip(), "100.0%"
+        )
+
     def test_first_wave_cache_label_is_warmup(self):
         from llm_bench.reporting import _round_cache_label
 
         self.assertEqual(
-            _round_cache_label({"wave": 1, "input_tokens": 1000, "cached_tokens": 0}),
+            _round_cache_label(
+                {"wave": 1, "input_tokens": 1000, "cached_tokens": 0},
+                warmup=True,
+            ),
             "预热·不计命中",
         )
         self.assertIn(
@@ -115,7 +146,15 @@ class CoreTest(unittest.TestCase):
                     "cache_turn": 2,
                 },
                 turn=2,
+                warmup=False,
             ),
+        )
+        self.assertEqual(
+            _round_cache_label(
+                {"wave": 2, "input_tokens": 1000, "cached_tokens": 0},
+                show_cache=False,
+            ),
+            "新命令",
         )
 
     def test_allow_incomplete_recovers_progressed_stream(self):

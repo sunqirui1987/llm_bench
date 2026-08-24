@@ -78,7 +78,46 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(params["max_tokens"].default, 500000)
         self.assertEqual(params["rounds"].default, 2)
         self.assertNotIn("steps", params)
+        self.assertNotIn("verbose", params)
+        self.assertNotIn("report_every", params)
         self.assertEqual(params["workers"].default, 1)
+
+    def test_print_start_miss_mentions_override_and_game_wrap(self):
+        from llm_bench.runner import _print_start
+
+        text = "\n".join(
+            _print_start(
+                hit_cache=False,
+                workers=20,
+                rounds=2,
+                duration=0,
+                cache_mode="miss",
+                fd_limit=0,
+                base_urls={
+                    "chat": "http://x/chat",
+                    "responses": "http://x/resp",
+                    "messages": "http://x/msg",
+                },
+                models=["grok-4.6"],
+                formats=["responses"],
+                initial_session="sess",
+                retries=2,
+                retry_delay=1.0,
+                timeout=10,
+                prompt="shared command",
+                max_input=4000,
+                context_window=8000,
+                plan={"input_tokens": 4000, "max_tokens": 2000},
+                pad=True,
+                custom_prompt=True,
+                custom_system=True,
+            )
+        )
+        self.assertIn("覆盖所有 work 的用户命令", text)
+        self.assertIn("循环复用", text)
+        self.assertIn("自定义系统提示", text)
+        self.assertNotIn("预热", text)
+        self.assertIn("每一次都换新命令", text)
 
     def test_bench_defaults_to_one_worker(self):
         self.assertEqual(configure_pool(16), 16)

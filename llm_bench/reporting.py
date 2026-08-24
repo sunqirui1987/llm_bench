@@ -35,13 +35,35 @@ def cache_percent(result: dict) -> str:
     )
 
 
-def is_first_request(row: dict) -> bool:
-    return int(row.get("wave") or row.get("turn") or 1) <= 1
+def first_success_by_worker(rows: list[dict]) -> dict[int, int]:
+    """每个 worker 第一次成功对应的 wave。失败的波次不在 rows 里。"""
+    first: dict[int, int] = {}
+    ordered = sorted(
+        rows,
+        key=lambda row: (
+            int(row.get("worker") or 1),
+            int(row.get("wave") or row.get("turn") or 1),
+        ),
+    )
+    for row in ordered:
+        worker = int(row.get("worker") or 1)
+        if worker not in first:
+            first[worker] = int(row.get("wave") or row.get("turn") or 1)
+    return first
+
+
+def is_first_request(row: dict, first_by_worker: dict[int, int] | None = None) -> bool:
+    worker = int(row.get("worker") or 1)
+    wave = int(row.get("wave") or row.get("turn") or 1)
+    if first_by_worker is None:
+        return wave <= 1
+    return wave == first_by_worker.get(worker, wave)
 
 
 def warm_rows(rows: list[dict]) -> list[dict]:
-    """去掉每个 worker 的第 1 次（冷启动），只留同样命令再来的样本。"""
-    return [row for row in rows if not is_first_request(row)]
+    """去掉每个 worker 的第一次成功（冷启动），只留同样命令再来的样本。"""
+    first = first_success_by_worker(rows)
+    return [row for row in rows if not is_first_request(row, first)]
 
 
 def aggregate_cache_percent(rows: list[dict], *, skip_first: bool = False) -> str:
@@ -88,15 +110,19 @@ OUTPUT_TAIL_WIDTH = 86
 
 
 def live_tail_lines(workers: int, header_lines: int = 18) -> int:
-    """按终端高度给每个 work 分尾部行数，避免 10 路把屏幕顶出去。"""
+    """按终端高度给每个 work 分尾部行数；至少留 1 行模型输出。"""
     workers = max(int(workers), 1)
     try:
         rows = int(shutil.get_terminal_size(fallback=(80, 40)).lines)
     except Exception:
         rows = 40
-    budget = max(int(rows) - int(header_lines) - 2, workers * 2)
-    per = budget // workers - 2
-    return max(0, min(OUTPUT_TAIL_LINES, per))
+    remaining = max(int(rows) - int(header_lines) - 2, 0)
+    per = remaining // workers - 2
+    if per >= OUTPUT_TAIL_LINES:
+        return OUTPUT_TAIL_LINES
+    if per >= 1:
+        return per
+    return 1
 
 
 class OutputLog:
@@ -130,76 +156,52 @@ class OutputLog:
         return
 
 
-def _step_label(worker: int, wave: int, step: int, steps: int) -> str:
-    return f"{worker_label(worker)} wave{wave} step{step}/{steps}"
-
-
-def _round_cache_label(state: dict, turn: int | None = None) -> str:
-    wave = int(state.get("wave") or turn or 1)
-    if wave <= 1:
-        return "预热·不计命中"
+def _round_cache_label(
+    state: dict,
+    turn: int | None = None,
+    *,
+    show_cache: bool = True,
+    warmup: bool = False,
+) -> str:
     inp = int(state.get("input_tokens") or 0)
     cached = int(state.get("cached_tokens") or 0)
     pct = state.get("cache_percent")
     cache_turn = int(state.get("cache_turn") or 0)
+    if show_cache and warmup:
+        return "预热·不计命中"
     if inp > 0:
         pct = 100.0 * cached / inp
         text = f"cache={pct:.1f}% ({cached}/{inp})"
     elif pct is None:
-        return "等命中结果"
+        return "新命令" if not show_cache else "等命中结果"
     else:
         text = f"cache={float(pct):.1f}%"
+    if not show_cache:
+        if inp > 0 and cached > 0:
+            return f"{text} 不应命中"
+        return "新命令"
     if cache_turn and turn and cache_turn != turn:
         return f"上轮 {text}"
     return text
 
 
-def print_bench_header(*, show_cache: bool = True) -> None:
-    extra = f"{'cache%':>8}" if show_cache else ""
-    print(
-        "完成的对话从这里往上滚（每路固定 5 步，输入 1/5 → 满；rounds 是再拉起一波全量线程）：",
-        flush=True,
-    )
-    print(
-        f"{'对话':<8}{'波/步':<10}{'TTFT':>10}{'tok/s':>9}{'E2E':>10}"
-        f"{'用户输入':>10}{'模型输出':>10}{extra}",
-        flush=True,
-    )
-    separator()
-
-
-def format_bench_row(index: int, result: dict, *, show_cache: bool = True) -> str:
-    retry_mark = (
-        f"  [retry={result['retry_count']}]" if result.get("retry_count") else ""
-    )
-    extra = f"{cache_percent(result):>8}" if show_cache else ""
-    worker = worker_label(result.get("worker") or 1)
-    wave = int(result.get("wave") or result.get("turn") or index)
-    return (
-        f"{worker:<8}r{wave:<3}"
-        f"{format_ms(result['ttft_ms'])}"
-        f"{format_tps(result.get('output_tps'))}"
-        f"{format_ms(result['e2e_ms'])}"
-        f"{int(result.get('input_tokens') or 0):>10}"
-        f"{int(result.get('output_tokens') or 0):>10}"
-        f"{extra}{retry_mark}"
-    )
-
-
-def print_bench_row(index: int, result: dict, *, show_cache: bool = True) -> None:
-    print(format_bench_row(index, result, show_cache=show_cache), flush=True)
-
-
 class WorkerBoard:
     """多路并发：每一波每人发一条命令。"""
 
-    def __init__(self, workers: int, rounds: int | None = None, steps: int = 1, waves: int = 1):
+    def __init__(
+        self,
+        workers: int,
+        rounds: int | None = None,
+        waves: int = 1,
+        *,
+        show_cache: bool = True,
+    ):
         self.workers = max(int(workers), 1)
         total = int(rounds if rounds is not None else waves)
         self.waves = max(total, 1)
-        self.steps = self.waves
         self.rounds = self.waves
         self.wave = 1
+        self.show_cache = bool(show_cache)
         self.tail_lines = OUTPUT_TAIL_LINES
         self.finished: list[dict] = []
         self._lock = threading.Lock()
@@ -401,44 +403,6 @@ class WorkerBoard:
             state = self._states.get(worker)
             return dict(state) if state is not None else None
 
-    def status_lines(self) -> list[str]:
-        now = time.perf_counter()
-        with self._lock:
-            items = sorted(self._states.items())
-        lines = []
-        for worker, state in items:
-            phase = state.get("phase") or "idle"
-            round_no = max(int(state.get("turn") or state.get("wave") or 0), 1)
-            out = int(state.get("out_tokens") or 0)
-            tok_s = float(state.get("tok_s") or 0.0)
-            ttft = state.get("ttft_ms")
-            started = state.get("started")
-            elapsed = (now - started) if started else 0.0
-            name = f"{worker_label(worker):<6}"
-            if phase == "stream":
-                first = f"  ttft={ttft / 1000:.1f}s" if ttft is not None else ""
-                lines.append(
-                    f"{name} 输出中  第{round_no}/{self.waves}次  "
-                    f"out={out}  {tok_s:.0f} tok/s{first}  {elapsed:.0f}s"
-                )
-            elif phase == "wait":
-                lines.append(
-                    f"{name} 等首字  第{round_no}/{self.waves}次  已等 {elapsed:.0f}s"
-                )
-            elif phase == "error":
-                err = (state.get("error") or "").strip()
-                lines.append(f"{name} 失败    第{round_no}/{self.waves}次  {err[:50]}")
-            elif int(state.get("done") or 0):
-                lines.append(
-                    f"{name} 完成    第{int(state.get('done'))}/{self.waves}次  out={out}"
-                )
-            else:
-                lines.append(f"{name} 空闲")
-        return lines
-
-    def compact_cells(self) -> list[str]:
-        return self.worker_lines()
-
     def warm_cache_label(self) -> str:
         with self._lock:
             rows = list(self.finished)
@@ -448,8 +412,10 @@ class WorkerBoard:
         now = time.perf_counter()
         with self._lock:
             items = sorted(self._states.items())
+            first_by_worker = first_success_by_worker(self.finished)
         lines = []
         waves = self.waves
+        show_cache = bool(getattr(self, "show_cache", True))
         for worker, state in items:
             phase = state.get("phase") or "idle"
             turn = max(int(state.get("turn") or 0), 1)
@@ -463,10 +429,19 @@ class WorkerBoard:
             err = (state.get("error") or "").strip()
             name = worker_label(worker)
             game = (state.get("game") or "").strip()
-            cache_bit = _round_cache_label(state, turn)
+            first_wave = first_by_worker.get(worker)
+            warmup = show_cache and (first_wave is None or first_wave == wave)
+            cache_bit = _round_cache_label(
+                state, turn, show_cache=show_cache, warmup=warmup
+            )
             inp = int(state.get("input_tokens") or 0)
             lines.append(f"{name}  《{game}》" if game else name)
-            phase_name = "预热" if wave <= 1 else "缓存"
+            if not show_cache:
+                phase_name = "换新"
+            elif warmup:
+                phase_name = "预热"
+            else:
+                phase_name = "缓存"
             prefix = f"  └─ {phase_name} {wave}/{waves}"
             if phase == "stream":
                 first = f" · 首字 {ttft / 1000:.1f}s" if ttft is not None else ""
@@ -506,11 +481,22 @@ def _output_tail(text: str, n: int = OUTPUT_TAIL_LINES) -> list[str]:
 class LiveFooter:
     """整屏清空后重画：顶部保留启动横幅，下面每个 work 只出现一次。"""
 
-    def __init__(self, *, stats, board: WorkerBoard, gate=None, header: list[str] | None = None):
+    def __init__(
+        self,
+        *,
+        stats,
+        board: WorkerBoard,
+        gate=None,
+        header: list[str] | None = None,
+        show_cache: bool | None = None,
+    ):
         self.stats = stats
         self.board = board
         self.gate = gate
         self.header = list(header or [])
+        self.show_cache = (
+            bool(board.show_cache) if show_cache is None else bool(show_cache)
+        )
         self._lock = threading.Lock()
         self._n = 0
         self._stop = threading.Event()
@@ -567,7 +553,9 @@ class LiveFooter:
             first = f"平均 {ttft / 1000:.1f} 秒才出第一个字"
         wave = max(int(self.board.wave), 1)
         total = max(int(self.board.waves), 1)
-        if wave <= 1:
+        if not self.show_cache:
+            stage = f"【第{wave}/{total}次 · 每次换新命令】"
+        elif wave <= 1:
             stage = f"【预热 第{wave}/{total}次 · 冷启动不计命中率】"
         else:
             warm = self.board.warm_cache_label()
@@ -586,70 +574,6 @@ class LiveFooter:
         return lines
 
 
-class RoundLiveDisplay:
-    """单路时：等首 token / 流式中用同一行刷新，结束再写成完整轮数据。"""
-
-    def __init__(self, index: int, *, worker: int = 1, turn: int = 1):
-        self.index = int(index)
-        self.worker = max(int(worker), 1)
-        self.turn = max(int(turn), 1)
-        self._lock = threading.Lock()
-        self._stop = threading.Event()
-        self._started = time.perf_counter()
-        self._snap: dict = {}
-        self._thread: threading.Thread | None = None
-
-    def start(self) -> None:
-        self._thread = threading.Thread(
-            target=self._tick, name="llm-bench-live", daemon=True
-        )
-        self._thread.start()
-        self.render()
-
-    def on_progress(self, snap: dict) -> None:
-        with self._lock:
-            self._snap = dict(snap)
-        self.render()
-
-    def note(self, message: str) -> None:
-        print(f"\n{message}", flush=True)
-
-    def _tick(self) -> None:
-        while not self._stop.wait(0.5):
-            self.render()
-
-    def render(self) -> None:
-        elapsed = time.perf_counter() - self._started
-        with self._lock:
-            snap = dict(self._snap)
-        ttft = snap.get("ttft_ms")
-        if ttft is None:
-            phase = "wait"
-            ttft_s = "      ..."
-        else:
-            phase = "stream"
-            ttft_s = f"{ttft:8.0f}ms"
-        chunks = int(snap.get("chunks") or 0)
-        out_tokens = int(snap.get("out_tokens") or 0)
-        tok_s = float(snap.get("tok_s") or 0.0)
-        line = (
-            f"\r{worker_label(self.worker):<8}r{self.turn:<3}{phase:<7}"
-            f" TTFT={ttft_s}  e2e={elapsed:6.1f}s  "
-            f"out≈{out_tokens:<6} tok/s={tok_s:5.1f}  chunks={chunks:<5}"
-        )
-        print(line.ljust(100), end="", flush=True)
-
-    def finish(self, final: str = "") -> None:
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=1)
-            self._thread = None
-        if final:
-            print("\r" + final.ljust(110), flush=True)
-        else:
-            print("\r" + " " * 110, flush=True)
-
-
 def print_model_average(rows: list[dict], *, show_cache: bool = True) -> None:
     separator()
     ttfts = [r["ttft_ms"] for r in rows]
@@ -663,11 +587,12 @@ def print_model_average(rows: list[dict], *, show_cache: bool = True) -> None:
         f"  E2E={format_ms(average([r['e2e_ms'] for r in rows])).strip()}"
     )
     if show_cache:
-        cold = [row for row in rows if is_first_request(row)]
+        first = first_success_by_worker(rows)
+        cold = [row for row in rows if is_first_request(row, first)]
         print(
             f"   cache 第1次(冷)={aggregate_cache_percent(cold).strip()}  "
             f"第2次起={aggregate_cache_percent(rows, skip_first=True).strip()}  "
-            f"（第1次不计入命中率）"
+            f"（每路第一次成功不计入命中率）"
         )
 
 
@@ -754,7 +679,7 @@ def print_stress_summary(
         if rows:
             tpm_line += (
                 f"  cache第2次起={aggregate_cache_percent(rows, skip_first=True).strip()}"
-                f"  (第1次冷启不计入)"
+                f"  (每路第一次成功不计入)"
             )
         else:
             tpm_line += f"  cache={snapshot.cache_percent:.1f}%"
@@ -816,7 +741,7 @@ def write_report(
             lines.append("")
         ttfts = [r["ttft_ms"] for r in rows]
         if show_cache:
-            lines.append("cache% 只计第 2 次起（第 1 次冷启动不计入）。")
+            lines.append("cache% 只计每路第一次成功之后（冷启动不计入）。")
             lines.append("")
         lines.append("| 范围 | TTFT avg | TTFT p95 | tok/s | cache% | input | output |")
         lines.append("|------|----------|----------|-------|--------|-------|--------|")

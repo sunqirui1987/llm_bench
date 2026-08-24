@@ -5,15 +5,13 @@ from __future__ import annotations
 import unittest
 
 from llm_bench.conversation import Conversation
-from llm_bench.games import GAMES
+from llm_bench.games import GAMES, pick_game
 from llm_bench.prompts import (
     DEFAULT_SYSTEM,
-    clip_text,
     compose_system,
     compose_user,
     pad_to_tokens,
     plan_request,
-    trim_messages,
 )
 
 
@@ -101,23 +99,9 @@ class ConversationTest(unittest.TestCase):
             8000,
         )
 
-    def test_trim_keeps_system_and_latest_user(self):
-        messages = [{"role": "system", "content": "S"}]
-        for index in range(20):
-            messages.append({"role": "user", "content": ("u" * 4000) + str(index)})
-            messages.append({"role": "assistant", "content": ("a" * 4000) + str(index)})
-        messages.append({"role": "user", "content": "latest"})
-        trim_messages(messages, budget=200)
-        self.assertEqual(messages[0]["role"], "system")
-        self.assertEqual(messages[-1]["content"], "latest")
-        self.assertLessEqual(len(messages), 5)
-
-    def test_clip_text_keeps_head_and_tail(self):
-        text = "HEAD" + ("x" * 400) + "TAIL"
-        clipped = clip_text(text, 20)
-        self.assertTrue(clipped.startswith("HEAD"))
-        self.assertTrue(clipped.endswith("TAIL"))
-        self.assertIn("truncated", clipped)
+    def test_games_wrap_after_catalog(self):
+        self.assertEqual(pick_game(0)["title"], pick_game(len(GAMES))["title"])
+        self.assertNotEqual(pick_game(0)["title"], pick_game(1)["title"])
 
     def test_pad_to_tokens_is_stable_for_same_salt(self):
         first = pad_to_tokens("BASE", 8000, salt="same")

@@ -117,6 +117,16 @@ class StressStatsTest(unittest.TestCase):
         stats = StressStats(workers=3, window=15, now=clock)
         board = WorkerBoard(3, waves=3)
         board.wave = 2
+        board.finished.append(
+            {
+                "worker": 1,
+                "wave": 1,
+                "turn": 1,
+                "input_tokens": 1000,
+                "cached_tokens": 0,
+                "cache_reported": True,
+            }
+        )
         board.update(
             1,
             phase="stream",
@@ -143,6 +153,34 @@ class StressStatsTest(unittest.TestCase):
         self.assertNotIn("快捷键", joined)
         self.assertTrue(any(line.strip() == "work1" for line in lines))
         self.assertEqual(joined.count("work1"), 1)
+
+    def test_live_footer_miss_does_not_use_warmup_labels(self):
+        from llm_bench.reporting import LiveFooter, WorkerBoard
+
+        clock = Clock()
+        stats = StressStats(workers=1, window=15, now=clock)
+        board = WorkerBoard(1, waves=2, show_cache=False)
+        board.wave = 2
+        board.update(
+            1,
+            phase="stream",
+            turn=2,
+            wave=2,
+            ttft_ms=400,
+            out_tokens=10,
+            tok_s=20,
+            started=0.0,
+            input_tokens=1000,
+            cached_tokens=0,
+        )
+        footer = LiveFooter(stats=stats, board=board, show_cache=False)
+        footer._tty = False
+        joined = "\n".join(footer._compose())
+        self.assertNotIn("预热", joined)
+        self.assertNotIn("【缓存", joined)
+        self.assertIn("换新", joined)
+        self.assertIn("每次换新命令", joined)
+        self.assertIn("新命令", joined)
 
     def test_live_footer_clears_screen_and_keeps_header(self):
         from io import StringIO
@@ -175,7 +213,7 @@ class StressStatsTest(unittest.TestCase):
         size = os.terminal_size((80, 24))
         with patch("llm_bench.reporting.shutil.get_terminal_size", return_value=size):
             self.assertEqual(live_tail_lines(1, header_lines=5), 4)
-            self.assertEqual(live_tail_lines(10, header_lines=18), 0)
+            self.assertEqual(live_tail_lines(10, header_lines=18), 1)
 
     def test_output_log_is_silent_and_writes_file(self):
         import tempfile

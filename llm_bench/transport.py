@@ -16,7 +16,6 @@ from . import session
 _http: Optional[requests.Session] = None
 _http_lock = threading.Lock()
 _local = threading.local()
-_pool_size = 8
 SSE_CHUNK_SIZE = 256
 
 
@@ -37,10 +36,9 @@ def headers(api_key: str, session_id: str | None = None) -> dict[str, str]:
 
 
 def configure_pool(size: int) -> int:
-    """记下并发规模。真正的 Session 按线程隔离，避免共享 Session 把请求串起来。"""
-    global _pool_size, _http
+    """关闭旧的共享 Session。真正的连接按线程隔离。"""
+    global _http
     size = max(int(size), 1)
-    _pool_size = size
     with _http_lock:
         old = _http
         _http = None
