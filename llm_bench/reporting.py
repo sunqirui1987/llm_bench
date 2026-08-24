@@ -149,28 +149,11 @@ def fit_line(text: str, width: int) -> str:
     return "".join(out) + "…"
 
 
-def live_tail_lines(workers: int, header_lines: int = 18) -> int:
-    """还能给每个 work 分几行尾巴。不够就 0，改走单行/网格，不要顶出屏幕。"""
-    workers = max(int(workers), 1)
-    _, rows = terminal_size()
-    remaining = max(rows - int(header_lines) - 2, 0)
-    per = remaining // workers - 2
-    if per >= OUTPUT_TAIL_LINES:
-        return OUTPUT_TAIL_LINES
-    return max(0, per)
-
-
 class OutputLog:
     """不往控制台打字。结束时把全文写入 logs/，面板自己刷。"""
 
     def __init__(self, log_dir=None):
         self.log_dir = log_dir
-
-    def start_step(self, *args, **kwargs) -> None:
-        return
-
-    def append_text(self, *args, **kwargs) -> None:
-        return
 
     def finish_step(
         self,
@@ -186,9 +169,6 @@ class OutputLog:
         folder.mkdir(parents=True, exist_ok=True)
         path = folder / f"w{worker:02d}-round{wave}.txt"
         path.write_text(str(result.get("text") or ""), encoding="utf-8")
-
-    def fail_step(self, *args, **kwargs) -> None:
-        return
 
 
 def _round_cache_label(
@@ -234,7 +214,6 @@ class WorkerBoard:
         self.workers = max(int(workers), 1)
         total = int(rounds if rounds is not None else waves)
         self.waves = max(total, 1)
-        self.rounds = self.waves
         self.wave = 1
         self.show_cache = bool(show_cache)
         self.tail_lines = OUTPUT_TAIL_LINES
@@ -263,9 +242,15 @@ class WorkerBoard:
 
     def set_wave(self, wave: int) -> None:
         self.wave = max(int(wave), 1)
+
+    def progress_waves(self) -> tuple[int, int]:
         with self._lock:
-            for state in self._states.values():
-                state.update(phase="idle", turn=0, wave=self.wave, done=0, error="")
+            waves = [
+                max(int(state.get("wave") or 1), 1) for state in self._states.values()
+            ]
+        if not waves:
+            return 1, 1
+        return min(waves), max(waves)
 
     def begin_round(
         self,
@@ -322,7 +307,7 @@ class WorkerBoard:
                     "turn": int(turn),
                     "input_tokens": inp,
                     "cached_tokens": cached,
-                    "cache_reported": True,
+                    "cache_reported": bool(result.get("cache_reported")),
                 }
             )
 
@@ -364,35 +349,6 @@ class WorkerBoard:
             )
         return _cb
 
-    def render(self) -> str:
-        now = time.perf_counter()
-        with self._lock:
-            items = sorted(self._states.items())
-        cells = []
-        for worker, state in items:
-            phase = state.get("phase") or "idle"
-            turn = int(state.get("turn") or 0)
-            started = state.get("started")
-            elapsed = (now - started) if started else 0.0
-            if phase == "idle":
-                cells.append(f"{worker_label(worker)} idle")
-            elif phase == "wait":
-                cells.append(f"{worker_label(worker)} r{turn} wait {elapsed:.0f}s out=0")
-            else:
-                ttft = state.get("ttft_ms")
-                ttft_s = f"{ttft:.0f}ms" if ttft is not None else "..."
-                out_tokens = int(state.get("out_tokens") or 0)
-                tok_s = float(state.get("tok_s") or 0.0)
-                cells.append(
-                    f"{worker_label(worker)} r{turn} ttft={ttft_s} "
-                    f"out={out_tokens} tok/s={tok_s:.0f} {elapsed:.0f}s"
-                )
-        lines = []
-        width = 3
-        for i in range(0, len(cells), width):
-            lines.append("   " + " | ".join(cells[i:i + width]))
-        return "\n".join(lines)
-
     def live_totals(self) -> dict:
         """在途流式汇总：未完成的轮也计入 out / tok/s / TTFT。"""
         now = time.perf_counter()
@@ -431,12 +387,6 @@ class WorkerBoard:
             "ttft_avg": (sum(ttfts) / len(ttfts)) if ttfts else None,
             "tok_s": (sum(tok_s_vals) / len(tok_s_vals)) if tok_s_vals else 0.0,
         }
-
-    def worker_state(self, worker: int) -> dict | None:
-        worker = max(int(worker), 1)
-        with self._lock:
-            state = self._states.get(worker)
-            return dict(state) if state is not None else None
 
     def warm_cache_label(self) -> str:
         with self._lock:
@@ -665,7 +615,6 @@ class LiveFooter:
             bool(board.show_cache) if show_cache is None else bool(show_cache)
         )
         self._lock = threading.Lock()
-        self._n = 0
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._tty = hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
@@ -683,9 +632,6 @@ class LiveFooter:
     def _run(self) -> None:
         while not self._stop.wait(0.4):
             self.refresh()
-
-    def log(self, text: str) -> None:
-        return
 
     def refresh(self) -> None:
         with self._lock:
@@ -713,7 +659,6 @@ class LiveFooter:
             # 最后一行不要再加换行，否则刚好写满屏幕时会把整页顶上去。
             sys.stdout.write("\n".join(lines))
         sys.stdout.flush()
-        self._n = 0
 
     def _compose(self, cols: int | None = None, rows: int | None = None) -> list[str]:
         tcols, trows = terminal_size()
@@ -722,32 +667,40 @@ class LiveFooter:
         snap = self.stats.snapshot()
         live = self.board.live_totals()
         limit = self.gate.limit if self.gate is not None else snap.workers
-        ttft = live["ttft_avg"]
-        if ttft is None:
-            first = "都还没出第一个字"
-        else:
-            first = f"平均 {ttft / 1000:.1f} 秒才出第一个字"
-        wave = max(int(self.board.wave), 1)
+        lo, hi = self.board.progress_waves()
         total = max(int(self.board.waves), 1)
+        span = f"第{lo}/{total}次" if lo == hi else f"第{lo}–{hi}/{total}次"
         if not self.show_cache:
-            stage = f"【第{wave}/{total}次 · 每次换新命令】"
-        elif wave <= 1:
-            stage = f"【预热 第{wave}/{total}次 · 冷启动不计命中率】"
+            stage = f"【各路独立 {span} · 每次换新命令】"
+        elif hi <= 1:
+            stage = f"【各路独立 {span} · 预热不计命中率】"
         else:
             warm = self.board.warm_cache_label()
-            stage = f"【缓存 第{wave}/{total}次 · 第2次起命中 {warm}】"
+            stage = f"【各路独立 {span} · 第2次起命中 {warm}】"
+        rate_s = max(float(snap.elapsed), 1.0)
+        live_out = int(live["out_tokens"] or 0)
+        tpm_in = float(snap.tpm_in)
+        tpm_out = (int(snap.output_tokens or 0) + live_out) / rate_s * 60.0
+        tpm_now = tpm_in + tpm_out
+        rate_line = (
+            f"⏱ {snap.elapsed:.0f}s  "
+            f"RPM={snap.rpm_window:.1f}  TPM={tpm_now:.0f} "
+            f"(in={tpm_in:.0f} out={tpm_out:.0f})  "
+            f"inflight={snap.in_flight}/{limit}  "
+            f"ok={snap.ok} fail={snap.fail} 429={snap.rate_limited}"
+        )
         live_line = (
-            f"⏱ {snap.elapsed:.0f}s  {stage}  inflight={snap.in_flight}/{limit}  "
-            f"ok={snap.ok} fail={snap.fail} 429={snap.rate_limited}  "
+            f"{stage}  "
             f"wait={live['waiting']} stream={live['streaming']}  "
-            f"out={live['out_tokens']}  {live['tok_s']:.1f} tok/s  {first}"
+            f"out={live_out}  {live['tok_s']:.1f} tok/s"
         )
         workers = max(int(self.board.workers), 1)
         full_header = list(self.header)
         short_header = _shrink_header(full_header)
+        status_lines = 2
 
         def overhead(header: list[str]) -> int:
-            return len(header) + (1 if header else 0) + 2
+            return len(header) + (1 if header else 0) + status_lines + 1
 
         header = full_header
         if overhead(full_header) + workers > rows:
@@ -760,6 +713,7 @@ class LiveFooter:
             lines.append("")
         lines.extend(
             [
+                fit_line(rate_line, cols),
                 fit_line(live_line, cols),
                 fit_line(sep, cols),
                 *self.board.worker_lines(budget=remain, width=cols),
@@ -918,6 +872,8 @@ def write_report(
         f"- workers: {meta.get('workers', '')}",
         f"- rounds: {meta.get('rounds', '')}",
         f"- system: {meta.get('system', '')}",
+        f"- effort: {meta.get('effort', '')}",
+        f"- via: {meta.get('via', 'http')}",
         f"- 接入: {meta.get('base_url', '')}",
         "",
     ]

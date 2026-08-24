@@ -6,7 +6,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable
 
 
 Now = Callable[[], float]
@@ -231,75 +231,3 @@ class AdaptiveGate:
                     self.limit += 1
                     self.success_streak = 0
             self._cv.notify_all()
-
-
-class StressReporter:
-    """后台定时打印 RPM/TPM，不打断压测线程。"""
-
-    def __init__(
-        self,
-        stats: StressStats,
-        interval: float,
-        printer: Callable[[str], None] = print,
-        limit_provider: Callable[[], int] | None = None,
-        show_cache: bool = True,
-    ):
-        self.stats = stats
-        self.interval = max(float(interval), 0.5)
-        self._print = printer
-        self.limit_provider = limit_provider
-        self.show_cache = bool(show_cache)
-        self.board = None
-        self._stop = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-
-    def start(self) -> None:
-        self._thread = threading.Thread(
-            target=self._run,
-            name="llm-bench-rpm",
-            daemon=True,
-        )
-        self._thread.start()
-
-    def stop(self) -> None:
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=self.interval + 1)
-            self._thread = None
-
-    def _run(self) -> None:
-        while not self._stop.wait(self.interval):
-            self.emit()
-
-    def emit(self) -> None:
-        snap = self.stats.snapshot()
-        limit = self.limit_provider() if self.limit_provider else snap.workers
-        live = self.board.live_totals() if self.board is not None else None
-        line = (
-            "⏱ "
-            f"{snap.elapsed:6.1f}s  inflight={snap.in_flight}/{limit}"
-            f"  ok={snap.ok}  fail={snap.fail}  429={snap.rate_limited}  5xx={snap.unavailable}"
-        )
-        if live is not None:
-            ttft = live["ttft_avg"]
-            ttft_s = f"{ttft:.0f}ms" if ttft is not None else "wait"
-            line += (
-                f"  wait={live['waiting']} stream={live['streaming']}"
-                f"  live_ttft={ttft_s}"
-                f"  live_out={live['out_tokens']}"
-                f"  live_tok/s={live['tok_s']:.1f}"
-            )
-        if snap.ok:
-            line += (
-                f"  done_ttft={snap.ttft_avg:.0f}ms"
-                f"  done_tok/s={snap.output_tps_avg:.1f}"
-                f"  rpm={snap.rpm_window:.1f}"
-                f"  tpm={snap.tpm_window:.0f}"
-            )
-            if self.show_cache:
-                line += f"  cache={snap.cache_percent:.1f}%"
-        self._print(line)
-        if self.board is not None:
-            board = self.board.render()
-            if board:
-                self._print(board)

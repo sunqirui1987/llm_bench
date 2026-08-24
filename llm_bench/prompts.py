@@ -1,4 +1,4 @@
-"""压测语料：按 worker 选游戏，把输入填到上限。"""
+"""压测语料：按 worker 选游戏。默认大输入、短输出，用来把 TPM 拉高。"""
 
 from __future__ import annotations
 
@@ -11,8 +11,13 @@ from .games import GAMES, pick_game
 
 CONTEXT_WINDOW = 500_000
 TOKEN_OVERHEAD = 2_048
-DEFAULT_OUTPUT_RESERVE = 65_536
-# 网关实测 500k 窗只给当前消息约 475k，再扣 user/roles/CACHE_BYPASS。
+DEFAULT_OUTPUT_TOKENS = 2_048
+DEFAULT_OUTPUT_RESERVE = DEFAULT_OUTPUT_TOKENS
+# 网关当前消息预算实测 475424。Lua 注释填充时粗估 41 万会涨到 54 万。
+GATEWAY_INPUT_BUDGET = 475_424
+MAX_PADDED_INPUT = 300_000
+# 默认垫满输入：一次请求计入大量 input token，短输出很快结束，TPM 才高。
+DEFAULT_PADDED_INPUT = MAX_PADDED_INPUT
 INPUT_FRAME_RESERVE = 2_048
 UNIQUE_PREFIX_LINES = 16
 
@@ -25,53 +30,47 @@ def _window_overhead(context_window: int) -> int:
     return max(percent, floor)
 
 
-TARGET_INPUT_TOKENS = (
-    CONTEXT_WINDOW - DEFAULT_OUTPUT_RESERVE - _window_overhead(CONTEXT_WINDOW)
+TARGET_INPUT_TOKENS = min(
+    DEFAULT_PADDED_INPUT,
+    CONTEXT_WINDOW - DEFAULT_OUTPUT_RESERVE - _window_overhead(CONTEXT_WINDOW),
+    MAX_PADDED_INPUT,
 )
 
 DEFAULT_SYSTEM = (
-    "你是《宿命旅途》的场景主持人。只用这份档案里的专属设定："
-    "竖屏放置小队卡牌 RPG，队伍最多五人，十五个难度层，每层 23 章、每章 5 关，"
-    "初始伙伴只有卡琳、麦琪、琳达。把当前场景写完整，写到输出上限，不要问是否继续。"
+    "You are a Pulse Lua 5.4 code generator. Output ONLY Lua source. "
+    "No markdown, no fences, no story prose. Implement a compact Game module "
+    "against pulse.* host APIs. Stop as soon as boot/tick/serialize work."
 )
 
-DEFAULT_USER = (
-    "请按系统里的《宿命旅途》档案，把下面这场戏从进界面写到首通结算结束。"
-    "不要改设定，不要发明档案里没有的英雄、页签或建筑，不要问是否继续，写到输出上限。\n"
-    "\n"
-    "1. 开始界面，选择区服「雷鸣区」，记下 firstLoginTime。\n"
-    "2. 看完开场情景对话。\n"
-    "3. 从卡琳、麦琪、琳达里选定卡琳，initialHeroId 写入该区服档案，编入 team。\n"
-    "4. 切到战斗页签，进入难度层 1、第 1 章、第 1 关，battleMode 为首通，客户端做自动战斗逐帧演算。\n"
-    "5. 通关申报和切关申报必须分开。申报关卡等于 currentStageId。"
-    "首通只奖一次，写入 clearedStages。\n"
-    "过程里要用到的字段：currentStageId、clearedStages、battleMode、roster、team、"
-    "initialHeroId、firstLoginTime。"
+OUTPUT_FILL = (
+    "Keep it compact. Only boot, tick, on_input, serialize, and return Game. "
+    "No extra tables, no test_*, no padding. Stop at the output cap."
 )
 
-WORKER_DOMAINS = tuple(game["title"] for game in GAMES)
+DEFAULT_USER = GAMES[0]["command"]
 
 _PAD_BLOCKS = (
     (
-        "【{domain} · {genre} · 卷 {i:06d}】\n"
-        "salt={salt}\n"
-        "{lore} 本条编号 {i:06d}。不要把别的游戏规则写进来。"
-        "layer={layer} chapter={chapter} stage={stage}。\n"
+        "-- [{domain} :: {genre} :: chunk {i:06d}]\n"
+        "-- salt={salt}\n"
+        "-- {lore}\n"
+        "-- pulse.world layer={layer} chapter={chapter} stage={stage}\n"
+        "-- do not mix other game modules into this file\n"
     ),
     (
-        "【{domain} 现场 {i:06d}】\n"
-        "salt={salt}\n"
-        "{lore} 发生在条目 {i:06d}。时间、工具、限制都按本游戏。\n"
+        "-- [{domain} api {i:06d}] salt={salt}\n"
+        "-- {lore}\n"
+        "-- local function _f{i:06d}(world) assert(world) end\n"
     ),
     (
-        "【{domain} 禁则 {i:06d}】\n"
-        "salt={salt}\n"
-        "{lore} 违反条目 {i:06d} 必须停手并记录。\n"
+        "-- [{domain} guard {i:06d}] salt={salt}\n"
+        "-- {lore}\n"
+        "-- if false then pulse.log.error('cross-game {i:06d}') end\n"
     ),
     (
-        "【{domain} 交接 {i:06d}】\n"
-        "salt={salt}\n"
-        "{lore} 交班只口头复述本游戏术语。编号 {i:06d}。\n"
+        "-- [{domain} handoff {i:06d}] salt={salt}\n"
+        "-- {lore}\n"
+        "-- -- verbal handoff uses this module's identifiers only #{i:06d}\n"
     ),
 )
 
@@ -96,7 +95,8 @@ def estimate_tokens(text: str) -> int:
             continue
         else:
             other += 1
-    return max(int(cjk * 1.4 + other / 3.5), 1)
+    # Lua 注释/标识符比普通英文更碎，/3.5 会低估。
+    return max(int(cjk * 1.4 + other / 2.5), 1)
 
 
 def read_text_file(path: str, *, label: str = "file") -> str:
@@ -130,15 +130,11 @@ def bust_prefix(body: str, lines: int = UNIQUE_PREFIX_LINES) -> str:
     return f"{header}\n{body}\nEND_CACHE_BYPASS {salt}"
 
 
-def game_bible() -> str:
-    path = Path(__file__).parent / "data" / "destiny_journey_context.md"
+def pulse_spec() -> str:
+    path = Path(__file__).parent / "data" / "pulse_framework.lua"
     if path.is_file():
         return path.read_text(encoding="utf-8").strip() + "\n"
     return ""
-
-
-def worker_domain(worker_id: int) -> str:
-    return pick_game(worker_id)["title"]
 
 
 def clamp_output_tokens(input_tokens: int, max_tokens: int, context_window: int) -> int:
@@ -148,10 +144,11 @@ def clamp_output_tokens(input_tokens: int, max_tokens: int, context_window: int)
 
 
 def fit_max_input(max_input: int, max_tokens: int, context_window: int) -> int:
-    """给输出留位置；输入上限不超过窗口。"""
+    """给输出留位置；输入上限不超过窗口，也不超过网关消息预算。"""
     window = max(int(context_window), 1)
     min_out = max(min(int(max_tokens), DEFAULT_OUTPUT_RESERVE, max(window // 5, 1)), 1)
     cap = max(window - _window_overhead(window) - min_out, 1)
+    cap = min(cap, MAX_PADDED_INPUT, GATEWAY_INPUT_BUDGET)
     return max(1, min(int(max_input), cap))
 
 
@@ -183,13 +180,7 @@ def pad_to_tokens(
     topic = domain or "未命名游戏"
     flavor = lore or topic
     kind = genre or "游戏"
-    if topic == "宿命旅途":
-        bible = game_bible()
-        if bible and "宿命旅途" not in body:
-            body = bible + body
-            if estimate_tokens(body) >= target:
-                return body
-    parts = [body.rstrip(), "\n===== CONTEXT PADDING =====\n"]
+    parts = [body.rstrip(), "\n-- ===== CONTEXT PADDING =====\n"]
     current = estimate_tokens("".join(parts))
 
     def render(index: int) -> str:
@@ -228,25 +219,18 @@ def pad_to_tokens(
 
 def compose_system(
     *,
-    kind: str = "short",
     text: str = "",
     file: str = "",
     context_file: str = "",
-    input_tokens: int = TARGET_INPUT_TOKENS,
-    salt: str = "stable",
 ) -> str:
-    """拼出系统提示。kind=long 时填到 input_tokens。"""
+    """拼出自定义系统提示。未传则空，避免把默认游戏塞进每一路。"""
     body = (text or "").strip()
     from_file = read_text_file(file, label="system_file").strip()
     if from_file:
         body = f"{from_file}\n{body}".strip() if body else from_file
-    if not body:
-        body = DEFAULT_SYSTEM
     context = load_context(context_file)
     if context:
         body = context + body
-    if (kind or "short").strip().lower() == "long":
-        return pad_to_tokens(body, input_tokens, salt=salt, domain="宿命旅途", genre="竖屏放置卡牌")
     return body
 
 
@@ -261,11 +245,19 @@ def compose_user(prompt: str = "", prompt_file: str = "") -> str:
 def game_prefix(worker_id: int, base_system: str, max_input: int, salt: str) -> str:
     """按 worker 生成该游戏自己的长前缀，不和其他 work 共用。"""
     game = pick_game(worker_id)
-    body = "\n".join(part for part in (game["system"], (base_system or "").strip()) if part)
-    if game["title"] == "宿命旅途":
-        bible = game_bible()
-        if bible:
-            body = bible + body
+    body = "\n".join(
+        part
+        for part in (
+            DEFAULT_SYSTEM,
+            f"游戏《{game['title']}》模块 {game.get('module') or ''}",
+            game["system"],
+            (base_system or "").strip(),
+        )
+        if part
+    )
+    spec = pulse_spec()
+    if spec:
+        body = spec + body
     target = max(int(max_input) - INPUT_FRAME_RESERVE, 1)
     return pad_to_tokens(
         body,
@@ -280,13 +272,13 @@ def game_prefix(worker_id: int, base_system: str, max_input: int, salt: str) -> 
 def build_hit_user(template: str = "", extra: str = "", worker_id: int = 0) -> str:
     """命中缓存：这个 worker 自己那款游戏的命令，每一波字节都一样。"""
     custom = (template or "").strip()
-    if custom and custom != DEFAULT_USER:
-        body = custom
-    else:
-        body = pick_game(worker_id)["command"]
+    catalog = not custom or custom == DEFAULT_USER
+    body = pick_game(worker_id)["command"] if catalog else custom
     extra = (extra or "").strip()
     if extra:
-        return f"{body}\n{extra}"
+        body = f"{body}\n{extra}"
+    if catalog:
+        body = f"{body}\n{OUTPUT_FILL}"
     return body
 
 
@@ -307,7 +299,8 @@ def build_miss_user(
         f"游戏《{game['title']}》（{game['genre']}）。",
         f"这一场要演：{beat}。",
         game["system"],
-        "不要问是否继续，写到输出上限。不要写成别的游戏。",
+        "只输出 Lua，不要文章，不要问是否继续。模块写完就停。不要写成别的游戏。",
+        OUTPUT_FILL,
         f"seq={seq} worker={worker_id:03d}",
     ]
     custom = (template or "").strip()

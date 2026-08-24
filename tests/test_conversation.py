@@ -7,7 +7,6 @@ import unittest
 from llm_bench.conversation import Conversation
 from llm_bench.games import GAMES, pick_game
 from llm_bench.prompts import (
-    DEFAULT_SYSTEM,
     compose_system,
     compose_user,
     estimate_tokens,
@@ -53,8 +52,12 @@ class ConversationTest(unittest.TestCase):
         a = Conversation(0, system="", user="", cache=True).outbound()
         b = Conversation(1, system="", user="", cache=True).outbound()
         self.assertNotEqual(a[1]["content"], b[1]["content"])
-        self.assertIn("卡琳", a[1]["content"])
+        self.assertIn("karin", a[1]["content"])
+        self.assertIn("只输出 Lua", a[1]["content"])
+        self.assertIn("Keep it compact", a[1]["content"])
+        self.assertIn("卡琳", a[0]["content"] + a[1]["content"])
         self.assertIn("潮汐港务", b[0]["content"] + b[1]["content"])
+        self.assertNotIn("卡琳", b[0]["content"])
 
     def test_miss_seq_rotates_scene_across_waves(self):
         a = Conversation(1, system="", user="", cache=False, seq=0).outbound()[1]["content"]
@@ -120,6 +123,8 @@ class ConversationTest(unittest.TestCase):
         text = game_prefix(1, "", 8000, "salt")
         self.assertLessEqual(estimate_tokens(text), 8000)
         self.assertIn("潮汐港务", text)
+        self.assertIn("Pulse", text)
+        self.assertNotIn("卡琳", text)
 
     def test_pad_blocks_carry_the_named_game(self):
         text = pad_to_tokens(
@@ -139,16 +144,10 @@ class ConversationTest(unittest.TestCase):
         self.assertEqual(plan["input_tokens"], 1000)
         self.assertGreater(plan["max_tokens"], 0)
 
-    def test_compose_system_short_is_plain_default(self):
-        text = compose_system(kind="short")
-        self.assertEqual(text, DEFAULT_SYSTEM)
+    def test_compose_system_empty_without_custom(self):
+        text = compose_system()
+        self.assertEqual(text, "")
         self.assertNotIn("CONTEXT PADDING", text)
-        self.assertIn("宿命旅途", text)
-
-    def test_compose_system_long_pads_with_game_bible(self):
-        text = compose_system(kind="long", input_tokens=8000)
-        self.assertIn("CONTEXT PADDING", text)
-        self.assertIn("宿命旅途", text)
 
     def test_compose_system_uses_custom_text_and_context_file(self):
         import tempfile
@@ -160,7 +159,6 @@ class ConversationTest(unittest.TestCase):
             context.write_text("CONTEXT_BODY\n", encoding="utf-8")
             system_file.write_text("FILE_SYS", encoding="utf-8")
             text = compose_system(
-                kind="short",
                 text="INLINE_SYS",
                 file=str(system_file),
                 context_file=str(context),
@@ -171,7 +169,7 @@ class ConversationTest(unittest.TestCase):
 
     def test_missing_context_file_raises(self):
         with self.assertRaises(FileNotFoundError):
-            compose_system(kind="long", context_file="/no/such/context.md")
+            compose_system(context_file="/no/such/context.md")
 
     def test_compose_user_prefers_file_then_prompt(self):
         import tempfile

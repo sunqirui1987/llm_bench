@@ -34,7 +34,7 @@ class ProtocolAdapterTest(unittest.TestCase):
     def setUp(self):
         session.configure("stable-affinity")
 
-    def exercise(self, module, lines):
+    def exercise(self, module, lines, **stream_kwargs):
         captured = {}
         response = FakeResponse(lines)
         response.test_case = self
@@ -59,6 +59,7 @@ class ProtocolAdapterTest(unittest.TestCase):
                 "system",
                 "user",
                 32,
+                **stream_kwargs,
             )
         finally:
             module.post_stream = original
@@ -134,6 +135,48 @@ class ProtocolAdapterTest(unittest.TestCase):
             (100, 80, "ok"),
         )
 
+    def test_reasoning_effort_is_protocol_native(self):
+        chat_req, _ = self.exercise(
+            chat,
+            [
+                'data: {"choices":[{"delta":{"content":"ok"}}]}',
+                "data: [DONE]",
+            ],
+            reasoning_effort="xhigh",
+        )
+        self.assertEqual(chat_req["payload"]["reasoning_effort"], "xhigh")
+        self.assertNotIn("reasoning", chat_req["payload"])
+
+        resp_req, _ = self.exercise(
+            responses,
+            [
+                'data: {"type":"response.output_text.delta","delta":"ok"}',
+            ],
+            reasoning_effort="xhigh",
+        )
+        self.assertEqual(resp_req["payload"]["reasoning"], {"effort": "xhigh"})
+        self.assertNotIn("reasoning_effort", resp_req["payload"])
+
+        msg_req, _ = self.exercise(
+            messages,
+            [
+                'data: {"type":"content_block_delta","delta":'
+                '{"type":"text_delta","text":"ok"}}',
+                'data: {"type":"message_stop"}',
+            ],
+            reasoning_effort="high",
+        )
+        self.assertEqual(msg_req["payload"]["output_config"], {"effort": "high"})
+
+    def test_empty_reasoning_effort_is_omitted(self):
+        request, _ = self.exercise(
+            responses,
+            [
+                'data: {"type":"response.output_text.delta","delta":"ok"}',
+            ],
+        )
+        self.assertNotIn("reasoning", request["payload"])
+        self.assertNotIn("reasoning_effort", request["payload"])
 
     def test_chat_sends_appended_history(self):
         history = [

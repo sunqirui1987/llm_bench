@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from ...config import apply_reasoning_effort
 from ...metrics import (
     StreamMeasurement,
     cache_is_measurable,
@@ -28,6 +29,7 @@ def stream(
     messages: list | None = None,
     session_id: str | None = None,
     on_progress=None,
+    reasoning_effort: str = "",
 ) -> dict:
     """调用 ``/v1/chat/completions`` 并解析 choices/usage 增量。"""
     if messages:
@@ -42,6 +44,7 @@ def stream(
         "stream": True,
         "stream_options": {"include_usage": True},
     }
+    apply_reasoning_effort(payload, reasoning_effort, kind="chat")
     affinity = session.affinity_for(session_id)
     if affinity:
         session.configure(affinity)

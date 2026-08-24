@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from .prompts import DEFAULT_USER, TARGET_INPUT_TOKENS, compose_system
+from .prompts import DEFAULT_USER, TARGET_INPUT_TOKENS
 
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
@@ -49,7 +49,7 @@ DEFAULT_MESSAGES_BASE_URL = env("LLM_MESSAGES_BASE_URL")
 DEFAULT_MODELS = env("LLM_MODELS", default="gpt-4o-mini")
 DEFAULT_WORKERS = max(int(env("LLM_WORKERS", default="1") or "1"), 1)
 DEFAULT_PROMPT = DEFAULT_USER
-SYSTEM_PROMPT = compose_system(kind="short")
+DEFAULT_EFFORT = env("LLM_EFFORT", "LLM_REASONING_EFFORT", default="high")
 
 
 def parse_list(value) -> list[str]:
@@ -85,6 +85,56 @@ def parse_cache_mode(value) -> str:
             f"未知 cache_mode: {value}；可选 miss（不带 session）或 hit（session 一直）"
         )
     return CACHE_MODE_ALIASES[text]
+
+
+# 对齐 sub2api / Grok Build：low medium high xhigh。空=不传，走网关默认。
+REASONING_EFFORT_ALIASES = {
+    "low": "low",
+    "medium": "medium",
+    "med": "medium",
+    "mid": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "x-high": "xhigh",
+    "extra": "xhigh",
+    "extrahigh": "xhigh",
+    "extra-high": "xhigh",
+    "max": "xhigh",
+    "ultra": "xhigh",
+    "minimal": "low",
+    "min": "low",
+    "": "",
+    "default": "",
+    "none": "",
+    "off": "",
+    "omit": "",
+}
+
+
+def parse_reasoning_effort(value) -> str:
+    """归一化推理强度。返回 low/medium/high/xhigh，空字符串表示请求里不带该字段。"""
+    text = str(value if value is not None else "high").strip().lower()
+    text = text.replace("_", "-")
+    if text not in REASONING_EFFORT_ALIASES:
+        raise ValueError(
+            f"未知推理强度: {value}；可选 low / medium / high / xhigh"
+            "（max/ultra=xhigh；空/none=不传）"
+        )
+    return REASONING_EFFORT_ALIASES[text]
+
+
+def apply_reasoning_effort(payload: dict, effort: str, *, kind: str) -> dict:
+    """按协议写入推理强度。responses=reasoning.effort，chat=reasoning_effort。"""
+    effort = (effort or "").strip().lower()
+    if not effort:
+        return payload
+    if kind == "responses":
+        payload["reasoning"] = {"effort": effort}
+    elif kind == "chat":
+        payload["reasoning_effort"] = effort
+    elif kind == "messages":
+        payload["output_config"] = {"effort": effort}
+    return payload
 
 
 def resolve_base_urls(

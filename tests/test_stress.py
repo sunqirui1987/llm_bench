@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from llm_bench.stress import AdaptiveGate, StressReporter, StressStats
+from llm_bench.stress import AdaptiveGate, StressStats
 
 
 class Clock:
@@ -76,40 +76,6 @@ class StressStatsTest(unittest.TestCase):
 
 
 
-    def test_reporter_can_hide_cache_percent(self):
-        clock = Clock()
-        stats = StressStats(workers=2, window=15, now=clock)
-        stats.begin()
-        clock.t = 1.0
-        stats.succeed({"input_tokens": 100, "output_tokens": 20, "cached_tokens": 80})
-        hidden = []
-        StressReporter(stats, interval=5, printer=hidden.append, show_cache=False).emit()
-        shown = []
-        StressReporter(stats, interval=5, printer=shown.append, show_cache=True).emit()
-        self.assertTrue(hidden)
-        self.assertNotIn("cache=", hidden[0])
-        self.assertIn("cache=", shown[0])
-        self.assertIn("ttft=", shown[0])
-        self.assertIn("tok/s=", shown[0])
-
-    def test_reporter_uses_live_board_tokens(self):
-        from llm_bench.reporting import WorkerBoard
-
-        clock = Clock()
-        stats = StressStats(workers=2, window=15, now=clock)
-        board = WorkerBoard(2)
-        board.update(1, phase="stream", turn=1, ttft_ms=800, out_tokens=120, tok_s=40, started=clock.t)
-        board.update(2, phase="wait", turn=1, out_tokens=0, started=clock.t)
-        printed = []
-        reporter = StressReporter(stats, interval=1, printer=printed.append, show_cache=True)
-        reporter.board = board
-        reporter.emit()
-        self.assertTrue(printed)
-        self.assertIn("live_out=120", printed[0])
-        self.assertIn("live_tok/s=", printed[0])
-        self.assertIn("work1", printed[1])
-        self.assertIn("out=120", printed[1])
-
     def test_live_footer_compose_is_short(self):
         from llm_bench.reporting import LiveFooter, WorkerBoard
 
@@ -150,9 +116,16 @@ class StressStatsTest(unittest.TestCase):
         self.assertIn("缓存", joined)
         self.assertIn("预热", joined)
         self.assertIn("cache=80.0%", joined)
+        self.assertIn("RPM=", joined)
+        self.assertIn("TPM=", joined)
         self.assertNotIn("快捷键", joined)
         self.assertTrue(any(line.strip() == "work1" for line in lines))
         self.assertEqual(joined.count("work1"), 1)
+        rate_at = next(i for i, line in enumerate(lines) if "TPM=" in line)
+        live_at = next(i for i, line in enumerate(lines) if "tok/s" in line)
+        self.assertEqual(live_at, rate_at + 1)
+        self.assertNotIn("tok/s", lines[rate_at])
+        self.assertNotIn("TPM=", lines[live_at])
 
     def test_live_footer_miss_does_not_use_warmup_labels(self):
         from llm_bench.reporting import LiveFooter, WorkerBoard
@@ -181,6 +154,14 @@ class StressStatsTest(unittest.TestCase):
         self.assertIn("换新", joined)
         self.assertIn("每次换新命令", joined)
         self.assertIn("新命令", joined)
+        lines = footer._compose(cols=80, rows=40)
+        status = [line for line in lines if "TPM=" in line or "tok/s" in line]
+        self.assertEqual(len(status), 2)
+        self.assertIn("TPM=", status[0])
+        self.assertIn("每次换新命令", status[1])
+        self.assertIn("tok/s", status[1])
+        for line in status:
+            self.assertFalse(line.endswith("…"))
 
     def test_live_footer_clears_screen_and_keeps_header(self):
         from io import StringIO
@@ -207,17 +188,6 @@ class StressStatsTest(unittest.TestCase):
         self.assertEqual(out.count("work1"), 1)
         self.assertNotIn("快捷键", out)
         self.assertFalse(out.endswith("\n"))
-
-    def test_live_tail_lines_shrinks_for_many_workers(self):
-        import os
-        from unittest.mock import patch
-
-        from llm_bench.reporting import live_tail_lines
-
-        size = os.terminal_size((80, 24))
-        with patch("llm_bench.reporting.shutil.get_terminal_size", return_value=size):
-            self.assertEqual(live_tail_lines(1, header_lines=5), 4)
-            self.assertEqual(live_tail_lines(10, header_lines=18), 0)
 
     def test_compose_fits_small_terminal_with_many_workers(self):
         from llm_bench.reporting import LiveFooter, WorkerBoard, display_width
@@ -305,7 +275,6 @@ class StressStatsTest(unittest.TestCase):
             log = OutputLog(log_dir=folder)
             buf = StringIO()
             with patch("sys.stdout", buf):
-                log.start_step(1, 1, planned_input=100, planned_output=50)
                 log.finish_step(1, 2, {"text": "Hello world!"})
             self.assertEqual(buf.getvalue(), "")
             saved = Path(folder) / "w01-round2.txt"

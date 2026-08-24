@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from ...config import apply_reasoning_effort
 from ...metrics import (
     StreamMeasurement,
     cache_is_measurable,
@@ -29,6 +30,7 @@ def stream(
     messages: list | None = None,
     session_id: str | None = None,
     on_progress=None,
+    reasoning_effort: str = "",
 ) -> dict:
     """调用 ``/v1/messages`` 并兼容非标准嵌套 usage。"""
     if messages:
@@ -58,6 +60,7 @@ def stream(
         }
         if system:
             payload["system"] = system
+    apply_reasoning_effort(payload, reasoning_effort, kind="messages")
     affinity = session.affinity_for(session_id)
     if affinity:
         session.configure(affinity)

@@ -31,6 +31,19 @@ class BrokenResponse:
 
 
 class CoreTest(unittest.TestCase):
+    def test_parse_reasoning_effort_aliases(self):
+        from llm_bench.config import parse_reasoning_effort
+
+        self.assertEqual(parse_reasoning_effort("high"), "high")
+        self.assertEqual(parse_reasoning_effort("XHIGH"), "xhigh")
+        self.assertEqual(parse_reasoning_effort("max"), "xhigh")
+        self.assertEqual(parse_reasoning_effort("ultra"), "xhigh")
+        self.assertEqual(parse_reasoning_effort("minimal"), "low")
+        self.assertEqual(parse_reasoning_effort(""), "")
+        self.assertEqual(parse_reasoning_effort("none"), "")
+        with self.assertRaises(ValueError):
+            parse_reasoning_effort("turbo")
+
     def test_session_is_sent_with_proxy_safe_affinity_header(self):
         session.configure("stable-affinity")
         request_headers = headers("secret")
@@ -304,7 +317,25 @@ class CoreTest(unittest.TestCase):
         self.assertGreaterEqual(overhead, 24_000)
         cap = fit_max_input(CONTEXT_WINDOW, CONTEXT_WINDOW, CONTEXT_WINDOW)
         self.assertLessEqual(cap + DEFAULT_OUTPUT_RESERVE + overhead, CONTEXT_WINDOW)
+        self.assertLessEqual(cap, 300_000)
         self.assertLessEqual(cap, 475_424)
+
+    def test_default_plan_prefers_large_input_short_output(self):
+        from llm_bench.prompts import (
+            CONTEXT_WINDOW,
+            DEFAULT_OUTPUT_TOKENS,
+            TARGET_INPUT_TOKENS,
+            plan_request,
+        )
+
+        plan = plan_request(
+            max_input=TARGET_INPUT_TOKENS,
+            max_tokens=DEFAULT_OUTPUT_TOKENS,
+            context_window=CONTEXT_WINDOW,
+        )
+        self.assertGreaterEqual(plan["input_tokens"], 250_000)
+        self.assertLessEqual(plan["max_tokens"], DEFAULT_OUTPUT_TOKENS)
+        self.assertGreater(plan["input_tokens"], plan["max_tokens"] * 50)
 
 
 if __name__ == "__main__":

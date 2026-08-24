@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from ...config import apply_reasoning_effort
 from ...metrics import (
     StreamMeasurement,
     cache_is_measurable,
@@ -28,6 +29,7 @@ def stream(
     messages: list | None = None,
     session_id: str | None = None,
     on_progress=None,
+    reasoning_effort: str = "",
 ) -> dict:
     """调用 ``/v1/responses`` 并解析 response.* SSE 事件。"""
     if messages:
@@ -41,6 +43,7 @@ def stream(
         "max_output_tokens": max_tokens,
         "stream": True,
     }
+    apply_reasoning_effort(payload, reasoning_effort, kind="responses")
     affinity = session.affinity_for(session_id)
     if affinity:
         session.configure(affinity)

@@ -1,4 +1,4 @@
-"""每个 worker 一款不同的游戏。hit 时这款游戏的命令原样再发。"""
+"""每个 worker 一款不同的 Pulse/Lua 游戏模块。hit 时这条实现命令原样再发。"""
 
 from __future__ import annotations
 
@@ -6,136 +6,332 @@ GAMES = (
     {
         "title": "宿命旅途",
         "genre": "竖屏放置卡牌",
+        "module": "destiny_journey",
         "system": (
-            "你是《宿命旅途》主持人。竖屏放置小队卡牌，队伍最多五人，十五难度层，"
-            "初始伙伴只有卡琳、麦琪、琳达。五页签：角色、日志、战斗、城镇、副本。"
+            "实现 Pulse 模块 destiny_journey。"
+            "实体 Hero/Stage/Team；页签 roster,log,battle,town,dungeon。"
+            "队伍最多 5 人，15 难度层。初始英雄只有 karin 卡琳、maggie 麦琪、linda 琳达。"
+            "只输出 Lua，不要文章。"
         ),
         "command": (
-            "演一场：选区服雷鸣区 → 选卡琳 → 难度1第1章第1关自动战斗 → 通关申报与切关分开。"
-            "字段：currentStageId、clearedStages、battleMode、initialHeroId。写到输出上限。"
+            "写出完整 Lua：return Game。"
+            "boot 里选区服 thunder、initialHeroId=karin、team={karin}。"
+            "tick 里打难度1第1章第1关，battleMode=first_clear，自动战斗逐帧。"
+            "通关申报 clear_stage 与切关申报 advance_stage 必须分开；"
+            "申报关卡等于 currentStageId；首通只奖一次，写入 clearedStages。"
+            "字段：currentStageId,clearedStages,battleMode,roster,team,"
+            "initialHeroId,firstLoginTime。只输出 Lua，写到输出上限。"
         ),
-        "lore": "主线是难度层/章节/关卡。终焉神殿换挡。挂机与离线共享收益表。服务端抽装备。",
-        "miss": ("霜原区选麦琪打第3层", "暮港终焉神殿换挡", "城镇铁匠铺洗练"),
+        "lore": (
+            "-- destiny_journey: layer/chapter/stage. temple_shift. "
+            "idle and offline share drop table. server rolls loot."
+        ),
+        "miss": (
+            "实现 frost_server.lua：霜原区选 maggie 打第3层，只输出 Lua",
+            "实现 temple_shift.lua：暮港终焉神殿换挡状态机，只输出 Lua",
+            "实现 smith_reroll.lua：城镇铁匠铺洗练，只输出 Lua",
+        ),
     },
     {
         "title": "潮汐港务",
         "genre": "海港调度模拟",
-        "system": "你是《潮汐港务》主持人。玩家当夜班调度，给货轮派泊位、吊机和引水员，潮汐表每小时变一次。",
-        "command": "演一场夜班：三艘船同时到港，潮位正在退，只有两个深水泊位。写调度单、冲突、误派吊机。写到输出上限。",
-        "lore": "泊位分深浅。引水员执照分航道。误派一次要写事故报告。潮汐表是权威，不能口头改。",
-        "miss": ("雾天只开北航道", "渔汛和油轮抢泊", "吊机钢丝报废停机"),
+        "module": "tide_harbor",
+        "system": (
+            "实现 Pulse 模块 tide_harbor。实体 Berth/Ship/Crane/Pilot。"
+            "泊位分 deep/shallow；引水员执照按航道。只输出 Lua，不要文章。"
+        ),
+        "command": (
+            "写出完整 Lua：return Game。"
+            "boot 三艘船同时到港，潮位 falling，只有两个深水泊位。"
+            "tick 里派泊位、吊机、引水员；误派要写 accident 表。"
+            "潮汐表是权威表，禁止口头改。只输出 Lua，写到输出上限。"
+        ),
+        "lore": "-- tide_harbor: berth depth, pilot license, accident report, tide table is source of truth.",
+        "miss": (
+            "实现 fog_north.lua：雾天只开北航道调度，只输出 Lua",
+            "实现 fish_oil.lua：渔汛和油轮抢泊位，只输出 Lua",
+            "实现 crane_wire.lua：吊机钢丝报废停机，只输出 Lua",
+        ),
     },
     {
         "title": "星轨快递",
         "genre": "轨道物流",
-        "system": "你是《星轨快递》主持人。包裹走低轨中继站，窗口只有九十秒，超时只能等下一圈。",
-        "command": "演一场：冷藏舱报警，中继站7号窗口还有四十秒。写分拣、抛货、地面站签收。写到输出上限。",
-        "lore": "轨道周期九十秒。冷藏舱掉温会废单。地面站只认舱单哈希。私自打开包裹算事故。",
-        "miss": ("太阳风暴改轨", "两件同哈希撞单", "舱门卡死改用备份臂"),
+        "module": "star_rail_post",
+        "system": (
+            "实现 Pulse 模块 star_rail_post。实体 Parcel/Relay/Window。"
+            "轨道窗口 90 秒。只输出 Lua，不要文章。"
+        ),
+        "command": (
+            "写出完整 Lua：return Game。"
+            "冷藏舱报警，中继站7号窗口还剩 40 秒。"
+            "实现分拣、抛货、地面站按舱单哈希签收。只输出 Lua，写到输出上限。"
+        ),
+        "lore": "-- star_rail_post: 90s window, cold-hold, manifest hash, opening parcel is accident.",
+        "miss": (
+            "实现 storm_reroute.lua：太阳风暴改轨，只输出 Lua",
+            "实现 hash_collision.lua：两件同哈希撞单，只输出 Lua",
+            "实现 door_jam.lua：舱门卡死改用备份臂，只输出 Lua",
+        ),
     },
     {
         "title": "夜市烟火",
         "genre": "摊位经营",
-        "system": "你是《夜市烟火》主持人。玩家摆炸串摊，要抢电箱、处理城管巡视、和隔壁粥摊抢位置。",
-        "command": "演一场开摊：电箱跳闸、排队二十人、城管还有十分钟到。写备料、改菜单、收摊。写到输出上限。",
-        "lore": "电箱分区限流。城管只认登记摊位号。油温是安全线。邻摊借调料要记账。",
-        "miss": ("暴雨改做冷盘", "食材供应商迟到", "摊位号被别人占了"),
+        "module": "night_market",
+        "system": (
+            "实现 Pulse 模块 night_market。实体 Stall/Grid/Inspector。"
+            "电箱分区限流。只输出 Lua，不要文章。"
+        ),
+        "command": (
+            "写出完整 Lua：return Game。"
+            "电箱跳闸、排队 20 人、巡视 10 分钟后到。"
+            "实现备料、改菜单、收摊状态机。只输出 Lua，写到输出上限。"
+        ),
+        "lore": "-- night_market: grid limit, stall_id, oil temp, neighbor loan ledger.",
+        "miss": (
+            "实现 rain_cold.lua：暴雨改做冷盘，只输出 Lua",
+            "实现 supply_late.lua：供应商迟到，只输出 Lua",
+            "实现 stall_taken.lua：摊位号被占，只输出 Lua",
+        ),
     },
     {
         "title": "地下一层",
         "genre": "地城探索",
-        "system": "你是《地下一层》主持人。只有一层地城，但房间每晚重组。火把有限，地图会骗人。",
-        "command": "演一场：三人小队进门，昨夜地图全错，火把只够走七个房间。写路线和一次撤退。写到输出上限。",
-        "lore": "房间每晚重组。火把是硬通货。门上记号可能是假路。撤退比通关更常见。",
-        "miss": ("只剩两根火把", "队友中毒要抬", "听见对面有人呼吸"),
+        "module": "dungeon_one",
+        "system": (
+            "实现 Pulse 模块 dungeon_one。实体 Room/Torch/Party。"
+            "房间每晚重组。只输出 Lua，不要文章。"
+        ),
+        "command": (
+            "写出完整 Lua：return Game。"
+            "三人小队进门，昨夜地图作废，火把只够 7 个房间。"
+            "实现寻路、假记号、撤退。只输出 Lua，写到输出上限。"
+        ),
+        "lore": "-- dungeon_one: nightly shuffle, torch currency, fake marks, retreat > clear.",
+        "miss": (
+            "实现 two_torches.lua：只剩两根火把，只输出 Lua",
+            "实现 carry_poison.lua：队友中毒要抬，只输出 Lua",
+            "实现 hear_breath.lua：听见对面呼吸，只输出 Lua",
+        ),
     },
     {
         "title": "田间纪事",
         "genre": "农事日历",
-        "system": "你是《田间纪事》主持人。玩家按节气种田，虫害、水利和邻里换工都写进田簿。",
-        "command": "演一场谷雨：水渠决口，秧苗要在天黑前补完，邻村换工只帮半天。写田簿和分工。写到输出上限。",
-        "lore": "节气不可跳。换工要还工。水渠是公共的，私自堵水会闹事。田簿是唯一记录。",
-        "miss": ("蝗虫过境", "旱井见底", "农具被借走没还"),
+        "module": "field_almanac",
+        "system": (
+            "实现 Pulse 模块 field_almanac。实体 Plot/Canal/Labor。"
+            "节气不可跳。只输出 Lua，不要文章。"
+        ),
+        "command": (
+            "写出完整 Lua：return Game。"
+            "谷雨：水渠决口，天黑前补秧，换工只帮半天。"
+            "实现田簿 ledger 和分工。只输出 Lua，写到输出上限。"
+        ),
+        "lore": "-- field_almanac: solar term lock, labor debt, public canal, ledger is only record.",
+        "miss": (
+            "实现 locust.lua：蝗虫过境，只输出 Lua",
+            "实现 dry_well.lua：旱井见底，只输出 Lua",
+            "实现 tool_loan.lua：农具被借走没还，只输出 Lua",
+        ),
     },
     {
         "title": "法庭速记",
         "genre": "庭审记录",
-        "system": "你是《法庭速记》主持人。玩家是书记员，只能记下听到的话，不能改证言。",
-        "command": "演一场：证人当庭改口，律师要求删除上一句，法官让你原样记录并标注改口时间。写出速记稿。写到输出上限。",
-        "lore": "速记不能润色。改口必须时间戳。删除请求记附录，正文不动。休庭铃一响就停笔。",
-        "miss": ("翻译耳机延迟", "旁听席喧哗", "物证编号对不上"),
+        "module": "court_steno",
+        "system": (
+            "实现 Pulse 模块 court_steno。实体 Transcript/Utterance/Appendix。"
+            "不能润色证言。只输出 Lua，不要文章。"
+        ),
+        "command": (
+            "写出完整 Lua：return Game。"
+            "证人改口，律师要求删除上一句，法官要求原样记录并打时间戳。"
+            "删除请求进 appendix，正文不动。只输出 Lua，写到输出上限。"
+        ),
+        "lore": "-- court_steno: no polish, timestamp recant, delete->appendix, recess bell stops write.",
+        "miss": (
+            "实现 translator_lag.lua：翻译耳机延迟，只输出 Lua",
+            "实现 gallery_noise.lua：旁听席喧哗，只输出 Lua",
+            "实现 exhibit_id.lua：物证编号对不上，只输出 Lua",
+        ),
     },
     {
         "title": "极地电台",
         "genre": "短波值守",
-        "system": "你是《极地电台》主持人。玩家值夜班，短波有杂音，补给飞机可能改降。",
-        "command": "演一场暴风雪夜班：呼号断续，油料只够发电机四小时，弱信号里有人求救。写值机日志。写到输出上限。",
-        "lore": "呼号格式固定。发电机油料是硬限制。不能把杂音听成指令。求救要复述核对。",
-        "miss": ("天线结冰", "备用电池鼓包", "两路呼号重叠"),
+        "module": "polar_radio",
+        "system": (
+            "实现 Pulse 模块 polar_radio。实体 Radio/Callsign/Generator。"
+            "呼号格式固定。只输出 Lua，不要文章。"
+        ),
+        "command": (
+            "写出完整 Lua：return Game。"
+            "暴风雪夜班：呼号断续，发电机油料 4 小时，弱信号求救。"
+            "实现值机日志与复述核对。只输出 Lua，写到输出上限。"
+        ),
+        "lore": "-- polar_radio: callsign grammar, fuel hard cap, noise is not command, repeat-back SOS.",
+        "miss": (
+            "实现 ice_antenna.lua：天线结冰，只输出 Lua",
+            "实现 swollen_cell.lua：备用电池鼓包，只输出 Lua",
+            "实现 two_calls.lua：两路呼号重叠，只输出 Lua",
+        ),
     },
     {
         "title": "车队夜奔",
         "genre": "长途货运",
-        "system": "你是《车队夜奔》主持人。三辆货车编队夜驶，只能用车灯和短讯联络。",
-        "command": "演一场：头车爆胎，后车要不要超车，山路只有一个避让点。写车队口令和处置。写到输出上限。",
-        "lore": "编队不许散。超车要报点。避让点一次只能停一辆。疲劳驾驶有强制休息。",
-        "miss": ("雾灯坏了", "桥梁限重", "后车失联两分钟"),
+        "module": "night_convoy",
+        "system": (
+            "实现 Pulse 模块 night_convoy。实体 Truck/Convoy/Layby。"
+            "编队不许散。只输出 Lua，不要文章。"
+        ),
+        "command": (
+            "写出完整 Lua：return Game。"
+            "头车爆胎，后车超车判定，山路只有一个避让点。"
+            "实现口令协议和强制休息。只输出 Lua，写到输出上限。"
+        ),
+        "lore": "-- night_convoy: no scatter, overtake report, one truck per layby, fatigue lock.",
+        "miss": (
+            "实现 fog_lamp.lua：雾灯坏了，只输出 Lua",
+            "实现 bridge_weight.lua：桥梁限重，只输出 Lua",
+            "实现 lost_tail.lua：后车失联两分钟，只输出 Lua",
+        ),
     },
     {
         "title": "古楼修缮",
         "genre": "古建修复",
-        "system": "你是《古楼修缮》主持人。斗拱、瓦当、地仗都有工序，不能用现代材料顶替。",
-        "command": "演一场：梁上有新裂纹，雨季三天后到，脚手架还没验收。写勘察和临时加固。写到输出上限。",
-        "lore": "工序不能颠倒。现代钢件只能做隐蔽支撑。验收签字前不能上人。裂纹要绘图存档。",
-        "miss": ("瓦匠没来", "彩画遇潮", "基础沉降加剧"),
+        "module": "old_tower",
+        "system": (
+            "实现 Pulse 模块 old_tower。实体 Beam/Scaffold/WorkOrder。"
+            "工序不能颠倒。只输出 Lua，不要文章。"
+        ),
+        "command": (
+            "写出完整 Lua：return Game。"
+            "梁上新裂纹，雨季 3 天后到，脚手架未验收。"
+            "实现勘察绘图和临时加固。只输出 Lua，写到输出上限。"
+        ),
+        "lore": "-- old_tower: process order, hidden steel only, no people before sign-off, crack drawing.",
+        "miss": (
+            "实现 no_tiler.lua：瓦匠没来，只输出 Lua",
+            "实现 damp_paint.lua：彩画遇潮，只输出 Lua",
+            "实现 settle.lua：基础沉降加剧，只输出 Lua",
+        ),
     },
     {
         "title": "深海勘探",
         "genre": "潜器作业",
-        "system": "你是《深海勘探》主持人。潜器有深度和氧气硬限制，机械臂一次只能抓一件。",
-        "command": "演一场：预定深度发现未知壳体，氧气还够三十七分钟，海缆在抖。写下潜取样上浮。写到输出上限。",
-        "lore": "深度锁死不能超。氧气表是权威。机械臂过热要停。上浮有减压停留。",
-        "miss": ("能见度骤降", "取样罐泄漏", "定位信标漂移"),
+        "module": "deep_dive",
+        "system": (
+            "实现 Pulse 模块 deep_dive。实体 Sub/Arm/Tank。"
+            "深度锁死。只输出 Lua，不要文章。"
+        ),
+        "command": (
+            "写出完整 Lua：return Game。"
+            "预定深度发现未知壳体，氧气 37 分钟，海缆在抖。"
+            "实现取样、过热停臂、减压上浮。只输出 Lua，写到输出上限。"
+        ),
+        "lore": "-- deep_dive: depth lock, O2 authority, arm overheat, decompression stops.",
+        "miss": (
+            "实现 blackout.lua：能见度骤降，只输出 Lua",
+            "实现 tank_leak.lua：取样罐泄漏，只输出 Lua",
+            "实现 beacon_drift.lua：定位信标漂移，只输出 Lua",
+        ),
     },
     {
         "title": "校园广播",
         "genre": "广播室值班",
-        "system": "你是《校园广播》主持人。课间只有八分钟，稿件要过审，不能播未经登记的歌。",
-        "command": "演一场课间：稿件最后一分钟被改，音乐U盘读不出来，操场还在等广播操。写值班流程。写到输出上限。",
-        "lore": "八分钟窗口。歌单要登记。临时口播也要留底。设备故障切备用麦。",
-        "miss": ("停电切蓄电池", "两个班级抢播", "校长要加通知"),
+        "module": "campus_radio",
+        "system": (
+            "实现 Pulse 模块 campus_radio。实体 Playlist/Mic/Window。"
+            "课间窗口 8 分钟。只输出 Lua，不要文章。"
+        ),
+        "command": (
+            "写出完整 Lua：return Game。"
+            "稿件最后一分钟被改，U盘读不出，操场等广播操。"
+            "实现过审、备用麦、口播留底。只输出 Lua，写到输出上限。"
+        ),
+        "lore": "-- campus_radio: 8min window, registered songs, temp speech logged, failover mic.",
+        "miss": (
+            "实现 battery_cut.lua：停电切蓄电池，只输出 Lua",
+            "实现 two_classes.lua：两个班级抢播，只输出 Lua",
+            "实现 principal_add.lua：校长加通知，只输出 Lua",
+        ),
     },
     {
         "title": "武馆晨课",
         "genre": "馆内日常",
-        "system": "你是《武馆晨课》主持人。晨课按桩功、套路、对练，伤病要停训，不能硬上。",
-        "command": "演一场晨课：新人马步站塌，老学员要散手，馆长让你先处理膝盖伤。写课表和现场。写到输出上限。",
-        "lore": "伤停是硬规则。散手必须有护具。新人不进对练。馆内不许私下加练夜课。",
-        "miss": ("雨天改室内", "护具不够", "有人发烧还来了"),
+        "module": "dojo_morning",
+        "system": (
+            "实现 Pulse 模块 dojo_morning。实体 Student/Drill/Injury。"
+            "伤停是硬规则。只输出 Lua，不要文章。"
+        ),
+        "command": (
+            "写出完整 Lua：return Game。"
+            "新人马步站塌，老学员要散手，先处理膝盖伤。"
+            "实现课表、护具检查、禁止夜课。只输出 Lua，写到输出上限。"
+        ),
+        "lore": "-- dojo_morning: injury stop, spar needs gear, novice no spar, no private night class.",
+        "miss": (
+            "实现 rain_indoor.lua：雨天改室内，只输出 Lua",
+            "实现 gear_short.lua：护具不够，只输出 Lua",
+            "实现 fever.lua：有人发烧还来了，只输出 Lua",
+        ),
     },
     {
         "title": "荒星温室",
         "genre": "殖民地农学",
-        "system": "你是《荒星温室》主持人。穹顶漏气会冻死作物，水循环是闭环，不能对外排放。",
-        "command": "演一场：三号棚湿度掉了，备用滤芯只有一套，下一班补给在三十六小时后。写排查保苗。写到输出上限。",
-        "lore": "闭环水。漏气优先修穹顶。滤芯不能拆着用。作物编号要和舱单一致。",
-        "miss": ("沙尘磨花玻璃", "种子库受潮", "工蜂机器人卡轨"),
+        "module": "dome_farm",
+        "system": (
+            "实现 Pulse 模块 dome_farm。实体 Dome/Filter/Crop。"
+            "水循环闭环。只输出 Lua，不要文章。"
+        ),
+        "command": (
+            "写出完整 Lua：return Game。"
+            "三号棚湿度掉了，备用滤芯一套，补给 36 小时后。"
+            "实现漏气优先、保苗、作物编号对舱单。只输出 Lua，写到输出上限。"
+        ),
+        "lore": "-- dome_farm: closed loop water, leak first, do not split filter, crop id == manifest.",
+        "miss": (
+            "实现 sand_glass.lua：沙尘磨花玻璃，只输出 Lua",
+            "实现 seed_damp.lua：种子库受潮，只输出 Lua",
+            "实现 bee_jam.lua：工蜂机器人卡轨，只输出 Lua",
+        ),
     },
     {
         "title": "河灯渡口",
         "genre": "摆渡与民俗",
-        "system": "你是《河灯渡口》主持人。渡船有载重和风向，河灯只能在开灯时辰放，不能提前。",
-        "command": "演一场黄昏：超载香客要过河放灯，风速在涨，对岸有人等着接船。写摆渡和劝返。写到输出上限。",
-        "lore": "载重线不能超。开灯时辰以鼓声为准。夜航要灯标。劝返也要记账。",
-        "miss": ("缆绳磨断", "有人落水", "对岸灯标灭了"),
+        "module": "lantern_ferry",
+        "system": (
+            "实现 Pulse 模块 lantern_ferry。实体 Ferry/Wind/Lantern。"
+            "载重线不能超。只输出 Lua，不要文章。"
+        ),
+        "command": (
+            "写出完整 Lua：return Game。"
+            "黄昏超载香客要过河放灯，风速在涨，对岸有人接船。"
+            "实现载重检查、开灯时辰、劝返记账。只输出 Lua，写到输出上限。"
+        ),
+        "lore": "-- lantern_ferry: load line, drum hour, night lamp, refusal still logged.",
+        "miss": (
+            "实现 rope_fray.lua：缆绳磨断，只输出 Lua",
+            "实现 overboard.lua：有人落水，只输出 Lua",
+            "实现 dark_mark.lua：对岸灯标灭了，只输出 Lua",
+        ),
     },
     {
         "title": "机库夜班",
         "genre": "机甲维护",
-        "system": "你是《机库夜班》主持人。机甲按工单拆装，液压和火控不能同时开盖。",
-        "command": "演一场夜班：三号机液压渗漏，明早要出巡，火控舱还在校准。写工单隔离交班。写到输出上限。",
-        "lore": "工单未关不能出库。液压和火控互锁。零件按序列号归还。交班必须口头复述。",
-        "miss": ("扭力扳手丢了", "冷却液标号错", "夜视仪固件回滚"),
+        "module": "hangar_night",
+        "system": (
+            "实现 Pulse 模块 hangar_night。实体 Mech/WorkOrder/Bay。"
+            "液压和火控互锁。只输出 Lua，不要文章。"
+        ),
+        "command": (
+            "写出完整 Lua：return Game。"
+            "三号机液压渗漏，明早出巡，火控舱还在校准。"
+            "实现工单隔离、序列号归还、口头交班表。只输出 Lua，写到输出上限。"
+        ),
+        "lore": "-- hangar_night: open work order blocks launch, hydro/fire lock, serial return, verbal handoff.",
+        "miss": (
+            "实现 missing_torque.lua：扭力扳手丢了，只输出 Lua",
+            "实现 coolant_sku.lua：冷却液标号错，只输出 Lua",
+            "实现 nv_rollback.lua：夜视仪固件回滚，只输出 Lua",
+        ),
     },
 )
 

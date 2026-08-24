@@ -6,7 +6,7 @@ import inspect
 import unittest
 
 from llm_bench import session
-from llm_bench.config import parse_cache_mode
+from llm_bench.config import DEFAULT_EFFORT, parse_cache_mode
 from llm_bench.conversation import Conversation
 from llm_bench.engine import run_pool
 import requests
@@ -48,12 +48,15 @@ class CaptureProtocol:
         messages=None,
         session_id="",
         on_progress=None,
+        reasoning_effort="",
+        **_kwargs,
     ):
         self.captured.append(
             {
                 "messages": messages,
                 "session_id_arg": session_id,
                 "max_tokens": max_tokens,
+                "reasoning_effort": reasoning_effort,
             }
         )
         payload = result(80 if session_id else 0)
@@ -75,8 +78,10 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(params["cache_mode"].default, "hit")
         self.assertEqual(params["system"].default, "long")
         self.assertEqual(params["formats"].default, "responses")
-        self.assertEqual(params["max_tokens"].default, 500000)
+        self.assertEqual(params["max_tokens"].default, 2048)
         self.assertEqual(params["rounds"].default, 2)
+        self.assertEqual(params["effort"].default, DEFAULT_EFFORT)
+        self.assertEqual(params["via"].default, "http")
         self.assertNotIn("steps", params)
         self.assertNotIn("verbose", params)
         self.assertNotIn("report_every", params)
@@ -118,6 +123,8 @@ class RunnerTest(unittest.TestCase):
         self.assertIn("自定义系统提示", text)
         self.assertNotIn("预热", text)
         self.assertIn("每一次都换新命令", text)
+        self.assertIn("effort", text)
+        self.assertIn("via", text)
 
     def test_bench_defaults_to_one_worker(self):
         self.assertEqual(configure_pool(16), 16)
@@ -133,7 +140,6 @@ class RunnerTest(unittest.TestCase):
             api_key="key",
             model="model",
             conversation=conv,
-            max_tokens=64,
             timeout=30,
             retries=0,
             retry_delay=0,
@@ -144,7 +150,6 @@ class RunnerTest(unittest.TestCase):
             api_key="key",
             model="model",
             conversation=conv,
-            max_tokens=64,
             timeout=30,
             retries=0,
             retry_delay=0,
@@ -156,6 +161,22 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(captured[0]["messages"], captured[1]["messages"])
         self.assertEqual(first["session_id"], conv.session_id)
         self.assertEqual(second["session_id"], conv.session_id)
+
+    def test_turn_request_forwards_reasoning_effort(self):
+        protocol = CaptureProtocol()
+        conv = Conversation(0, system="sys", user="hello", cache=True)
+        _turn_request(
+            protocol=protocol,
+            base_url="https://example.test",
+            api_key="key",
+            model="model",
+            conversation=conv,
+            timeout=30,
+            retries=0,
+            retry_delay=0,
+            reasoning_effort="xhigh",
+        )
+        self.assertEqual(protocol.captured[0]["reasoning_effort"], "xhigh")
 
     def test_connection_retry_reuses_the_same_miss_payload(self):
         class Flaky(CaptureProtocol):
@@ -183,7 +204,6 @@ class RunnerTest(unittest.TestCase):
                 api_key="key",
                 model="model",
                 conversation=conv,
-                max_tokens=64,
                 timeout=30,
                 retries=1,
                 retry_delay=0,
@@ -202,7 +222,6 @@ class RunnerTest(unittest.TestCase):
             api_key="key",
             model="model",
             conversation=conv,
-            max_tokens=64,
             timeout=30,
             retries=0,
             retry_delay=0,
@@ -213,7 +232,6 @@ class RunnerTest(unittest.TestCase):
             api_key="key",
             model="model",
             conversation=conv,
-            max_tokens=64,
             timeout=30,
             retries=0,
             retry_delay=0,
@@ -358,6 +376,74 @@ class RunnerTest(unittest.TestCase):
             self.assertTrue(all(item == messages[0] for item in messages))
         sessions = list(by_session)
         self.assertNotEqual(by_session[sessions[0]][0], by_session[sessions[1]][0])
+
+    def test_workers_do_not_wait_for_each_other_between_rounds(self):
+        import threading
+
+        seen: list[str] = []
+        lock = threading.Lock()
+        fast_done = threading.Event()
+        timed_out = []
+
+        class Independent(CaptureProtocol):
+            def stream(
+                self,
+                base_url,
+                api_key,
+                model,
+                system,
+                user,
+                max_tokens,
+                timeout=180,
+                messages=None,
+                session_id="",
+                on_progress=None,
+                reasoning_effort="",
+                **_kwargs,
+            ):
+                with lock:
+                    seen.append(session_id)
+                    fast_calls = sum(1 for item in seen if item.endswith("-w001"))
+                if session_id.endswith("-w000"):
+                    if not fast_done.wait(timeout=2):
+                        timed_out.append("slow worker waited on the other lane")
+                elif fast_calls >= 2:
+                    fast_done.set()
+                self.captured.append(
+                    {
+                        "messages": messages,
+                        "session_id_arg": session_id,
+                        "max_tokens": max_tokens,
+                    }
+                )
+                payload = result(80 if session_id else 0)
+                payload["session_id"] = session_id
+                return payload
+
+        rows, stats, _gate = run_pool(
+            workers=2,
+            rounds=2,
+            duration=0,
+            system="sys",
+            user="hello",
+            followup="",
+            cache=True,
+            session_prefix="pool",
+            protocol=Independent(),
+            base_url="https://example.test",
+            api_key="key",
+            model="model",
+            max_tokens=32,
+            timeout=30,
+            retries=0,
+            retry_delay=0,
+            throttle=0,
+            pad=False,
+        )
+        self.assertEqual(timed_out, [])
+        self.assertTrue(fast_done.is_set())
+        self.assertEqual(len(rows), 4)
+        self.assertEqual(stats.snapshot().ok, 4)
 
 
 if __name__ == "__main__":

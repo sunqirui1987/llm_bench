@@ -11,7 +11,8 @@
 
 示例：
   uv run run.py bench --cache_mode hit --workers 8 --rounds 2
-  uv run run.py bench --cache_mode miss --workers 8 --rounds 2
+  uv run run.py bench --via grok --effort xhigh --workers 4
+  uv run run.py bench --via cmd --cmd 'my-llm --file {prompt_file}'
   uv run run.py cache --rounds 2
 """
 

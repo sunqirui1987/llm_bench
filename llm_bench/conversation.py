@@ -6,6 +6,7 @@ import uuid
 
 from .prompts import (
     CONTEXT_WINDOW,
+    DEFAULT_OUTPUT_TOKENS,
     build_hit_user,
     build_miss_user,
     bust_prefix,
@@ -33,7 +34,7 @@ class Conversation:
         session_prefix: str = "llm-bench",
         followup: str = "",
         max_input: int = 0,
-        max_tokens: int = 500000,
+        max_tokens: int = DEFAULT_OUTPUT_TOKENS,
         context_window: int = CONTEXT_WINDOW,
         pad: bool | None = None,
         full_prefix: str | None = None,
@@ -69,7 +70,14 @@ class Conversation:
                 ),
             )
         else:
-            self.full_prefix = system or self.game["system"]
+            self.full_prefix = system or "\n".join(
+                part
+                for part in (
+                    f"游戏《{self.game_title}》",
+                    self.game.get("system") or "",
+                )
+                if part
+            )
         self.full_tokens = (
             max(int(full_tokens), 1)
             if full_tokens
